@@ -1,0 +1,34 @@
+@Gateway = http://localhost:5080
+
+### El cliente web y el móvil usan exactamente la misma URL y el mismo JSON.
+GET {{Gateway}}/api/desastres
+Accept: application/json
+
+### Registrar un desastre (201 Created, con cabecera Location).
+POST {{Gateway}}/api/desastres
+Content-Type: application/json
+
+{
+  "nombre": "Inundación del río Bogotá",
+  "ubicacion": "Bogotá, Cundinamarca",
+  "severidad": 4,
+  "descripcion": "Desbordamiento del río que afecta las vías del sector.",
+  "latitud": 4.7110,
+  "longitud": -74.0721
+}
+
+### Consultar por ID (ajustar según el registro creado).
+GET {{Gateway}}/api/desastres/1
+
+### Ejemplo inválido: devuelve 400 con errores por campo.
+POST {{Gateway}}/api/desastres
+Content-Type: application/json
+
+{
+  "nombre": "Reporte de prueba",
+  "ubicacion": "Bogotá",
+  "severidad": 6,
+  "descripcion": "La severidad debe estar entre 1 y 5.",
+  "latitud": 4.7110,
+  "longitud": -74.0721
+}

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#153e38">
+  <title>Desastres · Registro y mapa</title>
+  <link rel="stylesheet" href="/lib/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/lib/leaflet/leaflet.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="Desastres, inicio"><span class="brand-icon" aria-hidden="true">◎</span> Desastres<span class="brand-subtitle">REGISTRO TERRITORIAL</span></a>
+    <span class="header-note">Un reporte. Una ubicación.</span>
+  </header>
+  <main>
+    <section class="intro" aria-labelledby="title">
+      <div><p class="eyebrow">OBSERVA · UBICA · REGISTRA</p><h1 id="title">Cada reporte cuenta.</h1><p>Registra un desastre y consulta su ubicación en el mapa.</p></div>
+      <div class="total"><strong id="count">0</strong><span>desastres registrados</span></div>
+    </section>
+    <div class="workspace">
+      <section class="panel report-panel" aria-labelledby="form-title">
+        <div class="section-heading"><span class="step">01</span><h2 id="form-title">Registrar desastre</h2></div>
+        <p class="muted">Completa todos los campos para agregar un reporte.</p>
+        <form id="disaster-form">
+          <label for="nombre">Nombre</label>
+          <input id="nombre" name="nombre" required maxlength="120" placeholder="Ej. Inundación del río Bogotá">
+          <label for="ubicacion">Ubicación</label>
+          <input id="ubicacion" name="ubicacion" required maxlength="200" placeholder="Municipio, departamento o sector">
+          <label for="severidad">Severidad</label>
+          <select id="severidad" name="severidad" required>
+            <option value="">Selecciona un nivel</option>
+            <option value="1">1 · Muy baja</option><option value="2">2 · Baja</option>
+            <option value="3">3 · Moderada</option><option value="4">4 · Alta</option>
+            <option value="5">5 · Muy alta</option>
+          </select>
+          <label for="descripcion">Descripción</label>
+          <textarea id="descripcion" name="descripcion" required maxlength="2000" rows="3" placeholder="Describe lo ocurrido"></textarea>
+          <fieldset>
+            <legend>Coordenadas</legend>
+            <p id="coordinates-help" class="muted small">Toca el mapa para elegir el punto o escribe las coordenadas.</p>
+            <div class="coordinates">
+              <div><label for="latitud">Latitud</label><input id="latitud" name="latitud" type="number" step="any" min="-90" max="90" required aria-describedby="coordinates-help" placeholder="4.7110"></div>
+              <div><label for="longitud">Longitud</label><input id="longitud" name="longitud" type="number" step="any" min="-180" max="180" required aria-describedby="coordinates-help" placeholder="-74.0721"></div>
+            </div>
+          </fieldset>
+          <button id="submit" class="primary" type="submit">Registrar desastre <span aria-hidden="true">↗</span></button>
+          <p id="form-status" class="status" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+      <div class="results">
+        <section class="panel map-panel" aria-labelledby="map-title">
+          <div class="map-heading"><div class="section-heading"><span class="step">02</span><h2 id="map-title">Mapa de reportes</h2></div><button id="refresh" class="secondary" type="button">Actualizar</button></div>
+          <p id="map-hint" class="muted map-hint">Selecciona una ubicación para tu nuevo reporte.</p>
+          <div id="map" role="region" aria-label="Mapa interactivo de desastres. También puedes ingresar las coordenadas en el formulario."></div>
+          <div class="legend" aria-label="Niveles de severidad"><span>Severidad</span><span><i class="level-1"></i>1</span><span><i class="level-2"></i>2</span><span><i class="level-3"></i>3</span><span><i class="level-4"></i>4</span><span><i class="level-5"></i>5</span></div>
+        </section>
+        <section class="panel list-panel" aria-labelledby="list-title">
+          <div class="section-heading"><span class="step">03</span><h2 id="list-title">Reportes registrados</h2></div>
+          <p id="list-status" class="status" role="status" aria-live="polite"></p>
+          <div id="disaster-list"></div>
+        </section>
+      </div>
+    </div>
+  </main>
+  <footer>Desastres · Registro y consulta de ubicaciones</footer>
+</body>
+</html>
