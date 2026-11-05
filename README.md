@@ -54,17 +54,17 @@ La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus
 
 ### El DAL, paso a paso
 
-1. La BLL valida el reporte y llama a `IDisasterRepository.AddAsync`.
+1. La API lee `Idempotency-Key`. La BLL valida el UUID y el reporte, y consulta si esa operación ya existe.
 2. La inyección de dependencias resuelve esa interfaz con `DisasterRepository`, implementado en el DAL.
-3. El repositorio agrega la entidad al `DisasterDbContext` y llama a `SaveChangesAsync`.
-4. EF Core ejecuta el `INSERT` en SQLite y devuelve el identificador generado.
-5. La API responde `201 Created`; el gateway conserva el código, el JSON y la cabecera `Location`.
+3. Si la operación existe, la BLL compara los datos normalizados y devuelve el registro, o un conflicto si cambiaron.
+4. Si no existe, el repositorio guarda con EF Core. Un índice único sobre `OperationId` evita duplicados incluso si llegan dos solicitudes al mismo tiempo. Si otra solicitud guardó primero, se recupera su registro y la BLL también compara el contenido.
+5. La API responde `201 Created` al crear, `200 OK` al recuperar o `409 Conflict` si se reutilizó la clave con otros datos. El gateway conserva estas respuestas.
 
 Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y SQLite está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
 
 La base se crea automáticamente en `DisasterLocation/App_Data/disasters.db`. Los registros sobreviven a reinicios. La conexión se configura en `DisasterLocation/appsettings.json`, sección `ConnectionStrings:Disasters`; una ruta relativa se resuelve desde el directorio de la API.
 
-Para mantenerlo sencillo se usa `EnsureCreatedAsync`, sin migraciones. Si cambias el esquema durante el taller, elimina la base **solo si puedes perder sus datos**, o incorpora migraciones antes de conservar información existente. `EnsureCreatedAsync` no actualiza tablas ya creadas.
+Para mantenerlo sencillo se usa `EnsureCreatedAsync` y una actualización puntual en `DependencyInjection.cs`: si la tabla anterior no tiene `OperationId`, agrega la columna y crea el índice único dentro de una transacción. Los datos anteriores conservan su ID y quedan con la clave en `NULL`. No hay que borrar la base. Esta actualización puede ejecutarse de nuevo; para futuros cambios de esquema conviene incorporar migraciones.
 
 ## Contrato compartido por web y móvil
 
@@ -72,9 +72,9 @@ Para mantenerlo sencillo se usa `EnsureCreatedAsync`, sin migraciones. Si cambia
 | --- | --- | --- |
 | GET | `/api/desastres` | `200`, arreglo de desastres (vacío si no hay registros). |
 | GET | `/api/desastres/{id}` | `200`, un desastre; `404` si no existe. |
-| POST | `/api/desastres` | `201`, desastre creado con `id` y cabecera `Location`; `400` si los datos son inválidos. |
+| POST | `/api/desastres` | `201` al crear, `200` al repetir la operación, `409` si cambia su contenido; `400` si los datos o la clave son inválidos. |
 
-Solicitud de registro:
+Solicitud de registro, con la cabecera `Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000`:
 
 ```json
 {
@@ -97,6 +97,8 @@ La presentación web llama a `fetch('/api/desastres')`. Un cliente móvil .NET p
 using System.Net.Http.Json;
 
 using var client = new HttpClient { BaseAddress = new Uri("http://IP_DEL_COMPUTADOR:5080") };
+// Generar una vez por reporte y conservar este valor para sus reintentos.
+client.DefaultRequestHeaders.Add("Idempotency-Key", Guid.NewGuid().ToString());
 var response = await client.PostAsJsonAsync("/api/desastres", new
 {
     nombre = "Deslizamiento",
@@ -108,6 +110,30 @@ var response = await client.PostAsJsonAsync("/api/desastres", new
 });
 response.EnsureSuccessStatusCode();
 ```
+
+## Reintentos desde Android
+
+Cada reporte pendiente debe tener su propio UUID, creado y guardado en el teléfono junto con el contenido antes del primer envío. Al recuperar la conexión, Android vuelve a enviar ese mismo cuerpo y esa misma clave. Tanto `201` como `200` confirman el registro: guarda el ID del servidor y marca el pendiente como sincronizado. Si se pierde la respuesta, se puede repetir la solicitud sin crear otro registro.
+
+Un `400` requiere corregir los datos. Un `409` indica que la clave ya pertenece a otro contenido y requiere revisar el pendiente; no debe reintentarse indefinidamente ni cambiarse el UUID automáticamente. Para fallos de red o del servidor, conserva el pendiente y reintenta con espera progresiva. La cola local y el trabajo automático de sincronización se implementan en Android; este repositorio prepara la API. `DataSet` y `DataTable` son componentes de .NET y no se necesitan en el servidor para este flujo.
+
+Con Retrofit, `@POST("desastres")` funciona si el `baseUrl` termina en `/api/`, por ejemplo `http://IP_DEL_COMPUTADOR:5080/api/`. El JSON de respuesta sigue teniendo los mismos campos, incluido el `id` entero, por lo que sirve para `DisasterInfoDto`.
+
+La cabecera acepta un UUID con guiones, distinto de cero, sin distinguir mayúsculas. Si se envía vacía o con un formato inválido, se responde `400`. Para conservar la compatibilidad con la web actual, las solicitudes sin cabecera siguen creando registros, pero sus reenvíos no se deduplican. La comparación contempla los seis campos del reporte después de quitar los espacios al inicio y al final de los textos.
+
+Puedes comprobarlo con:
+
+```bash
+KEY="550e8400-e29b-41d4-a716-446655440000"
+BODY='{"nombre":"Deslizamiento","ubicacion":"Bogotá","severidad":4,"descripcion":"Deslizamiento sobre una vía","latitud":4.711,"longitud":-74.0721}'
+
+curl -i http://localhost:5080/api/desastres \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $KEY" \
+  -d "$BODY"
+```
+
+La primera vez devuelve `201`. Repite el comando: devuelve `200` con el mismo ID. Cambia `nombre` en `BODY` sin cambiar `KEY`: devuelve `409`. Con `curl http://localhost:5080/api/desastres` puedes confirmar que solo se creó un registro para esa operación.
 
 El gateway no necesita saber si la solicitud viene de una web o de una app móvil. Para ver la web en un celular conectado a la misma red, inicia el gateway con:
 
@@ -128,6 +154,6 @@ dotnet build
 python3 scripts/smoke_test.py
 ```
 
-La prueba inicia API y gateway en puertos temporales y usa una base temporal. Verifica registro con clientes web y móvil, consulta, validación, reenvío de errores y cabeceras, CORS, restricciones del DAL y persistencia después de reiniciar la API. Al terminar detiene los procesos y elimina sus datos de prueba.
+La prueba inicia API y gateway en puertos temporales y usa bases temporales. Comprueba el registro web y móvil, validación, reintentos `201/200`, conflictos `409`, solicitudes concurrentes, CORS y el índice único. También comprueba que un reintento conserva su ID tras reiniciar la API y que una base con el esquema anterior se actualiza sin perder registros. Al terminar detiene los procesos y elimina sus datos de prueba.
 
 Referencias: [YARP](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/getting-started?view=aspnetcore-10.0), [EF Core con SQLite](https://learn.microsoft.com/en-us/training/modules/build-web-api-minimal-database/), [Leaflet 1.9](https://leafletjs.com/examples-v1/quick-start/).

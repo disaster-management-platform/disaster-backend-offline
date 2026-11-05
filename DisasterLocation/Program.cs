@@ -28,16 +28,26 @@ disasters.MapGet("/{id:int}", async (int id, DisasterService service, Cancellati
     return disaster is null ? Results.NotFound() : Results.Ok(disaster);
 }).WithName("GetDisaster").WithSummary("Consulta un desastre por su identificador.");
 
-disasters.MapPost("/", async (CreateDisasterRequest request, DisasterService service, CancellationToken ct) =>
+disasters.MapPost("/", async (HttpRequest httpRequest, CreateDisasterRequest request,
+    DisasterService service, CancellationToken ct) =>
 {
+    var idempotencyKey = httpRequest.Headers.TryGetValue("Idempotency-Key", out var values)
+        ? values.ToString() : null;
     try
     {
-        var disaster = await service.CreateAsync(request, ct);
-        return Results.Created($"/api/desastres/{disaster.Id}", disaster);
+        var result = await service.CreateAsync(request, idempotencyKey, ct);
+        return result.Created
+            ? Results.Created($"/api/desastres/{result.Disaster.Id}", result.Disaster)
+            : Results.Ok(result.Disaster);
     }
     catch (DisasterValidationException exception)
     {
         return Results.ValidationProblem(exception.Errors);
+    }
+    catch (DisasterConflictException exception)
+    {
+        return Results.Problem(statusCode: StatusCodes.Status409Conflict,
+            title: "Conflicto de idempotencia", detail: exception.Message);
     }
 }).WithSummary("Registra un desastre con sus coordenadas.");
 

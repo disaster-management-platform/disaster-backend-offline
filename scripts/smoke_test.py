@@ -4,6 +4,7 @@ Ejecutar desde la raíz: dotnet build && python3 scripts/smoke_test.py
 No modifica los datos de la aplicación ni usa sus puertos de desarrollo.
 """
 import json
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import socket
@@ -11,6 +12,7 @@ import sqlite3
 import subprocess
 import tempfile
 import time
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -67,6 +69,94 @@ def stop(process):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def verify_idempotency(base, payload):
+    key = str(uuid.uuid4())
+    operation = {"Idempotency-Key": key, "User-Agent": "okhttp/Android"}
+    status, headers, saved = request(base, method="POST", data=payload, headers=operation)
+    assert status == 201 and headers["Location"] == f'/api/desastres/{saved["id"]}'
+    assert set(saved) == set(payload) | {"id"}, "El JSON debe conservar el contrato de Android"
+    for retry_key in [key, key.upper()]:
+        status, _, replay = request(base, method="POST", data=payload,
+            headers={"Idempotency-Key": retry_key})
+        assert status == 200 and replay == saved, (status, replay)
+    normalized = {**payload, "nombre": payload["nombre"].strip()}
+    assert request(base, method="POST", data=normalized, headers=operation)[0] == 200
+    for change in [{"nombre": "Otro nombre"}, {"ubicacion": "Cali"}, {"severidad": 2},
+                   {"descripcion": "Otra descripción"}, {"latitud": 1}, {"longitud": 1}]:
+        status, _, problem = request(base, method="POST", data={**payload, **change}, headers=operation)
+        assert status == 409 and problem["status"] == 409, (change, problem)
+    for invalid_key in ["", "no-es-uuid", str(uuid.UUID(int=0)), key + "," + key, key.replace("-", "")]:
+        status, _, problem = request(base, method="POST", data=payload,
+            headers={"Idempotency-Key": invalid_key})
+        assert status == 400 and "Idempotency-Key" in problem["errors"], (invalid_key, problem)
+    # Una clave conocida tampoco permite omitir la validación del cuerpo.
+    assert request(base, method="POST", data={**payload, "severidad": 0}, headers=operation)[0] == 400
+
+    concurrent_key = str(uuid.uuid4())
+    def send(body):
+        return request(base, method="POST", data=body, headers={"Idempotency-Key": concurrent_key})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(send, [payload] * 8))
+    assert sorted(result[0] for result in results) == [200] * 7 + [201], results
+    assert len({result[2]["id"] for result in results}) == 1
+
+    concurrent_key = str(uuid.uuid4())
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(send, [payload, {**payload, "nombre": "Contenido diferente"}]))
+    assert sorted(result[0] for result in results) == [201, 409], results
+
+    # El contenido por sí solo no identifica una operación.
+    assert request(base, method="POST", data=payload,
+        headers={"Idempotency-Key": str(uuid.uuid4())})[0] == 201
+    assert len(request(base)[2]) == 6, "Cada operación debe crear exactamente un registro"
+    return operation, saved
+
+
+def verify_schema_upgrade(folder, log, processes):
+    database = Path(folder) / "legacy.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript('''
+            CREATE TABLE Desastres (
+                Id INTEGER NOT NULL CONSTRAINT PK_Desastres PRIMARY KEY AUTOINCREMENT,
+                Nombre TEXT NOT NULL, Ubicacion TEXT NOT NULL, Severidad INTEGER NOT NULL,
+                Descripcion TEXT NOT NULL, Latitud REAL NOT NULL, Longitud REAL NOT NULL,
+                CONSTRAINT CK_Desastres_Severidad CHECK (Severidad BETWEEN 1 AND 5),
+                CONSTRAINT CK_Desastres_Latitud CHECK (Latitud BETWEEN -90 AND 90),
+                CONSTRAINT CK_Desastres_Longitud CHECK (Longitud BETWEEN -180 AND 180)
+            );
+            INSERT INTO Desastres (Nombre, Ubicacion, Severidad, Descripcion, Latitud, Longitud)
+            VALUES ('Histórico 1', 'Bogotá', 1, 'Antes de la actualización', 0, 0),
+                   ('Histórico 2', 'Cali', 2, 'Antes de la actualización', 1, 1);
+        ''')
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    payload = {"nombre": "Reporte nuevo", "ubicacion": "Bogotá", "severidad": 3,
+               "descripcion": "Después de la actualización", "latitud": 4.711, "longitud": -74.0721}
+    operation = {"Idempotency-Key": str(uuid.uuid4())}
+    saved = None
+    for attempt in range(2):
+        backend = start("DisasterLocation", port,
+            {"ConnectionStrings__Disasters": f"Data Source={database}"}, log)
+        processes.append(backend)
+        wait_ready(base, "/api/desastres", backend)
+        records = request(base)[2]
+        historical = [row for row in records if row["id"] in (1, 2)]
+        assert {row["nombre"] for row in historical} == {"Histórico 1", "Histórico 2"}
+        assert len(records) == 2 + attempt
+        status, _, replay = request(base, method="POST", data=payload, headers=operation)
+        if attempt == 0:
+            assert status == 201 and replay["id"] == 3
+            saved = replay
+        else:
+            assert status == 200 and replay == saved
+        stop(backend)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM Desastres WHERE OperationId IS NULL").fetchone()[0] == 2
+        assert any(row[1] == "IX_Desastres_OperationId" and row[2] == 1
+                   for row in connection.execute("PRAGMA index_list('Desastres')"))
 
 
 def main():
@@ -141,25 +231,37 @@ def main():
                     assert gateway_problem[field] == api_problem[field]
                 status, headers, _ = request(gateway_url, method="OPTIONS", headers={
                     "Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "content-type"
+                    "Access-Control-Request-Headers": "content-type,idempotency-key"
                 })
                 assert status == 204 and headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
+                assert "idempotency-key" in headers["Access-Control-Allow-Headers"].lower()
+
+                operation, idempotent = verify_idempotency(gateway_url, payload)
 
                 stop(backend)
                 assert request(gateway_url)[0] == 502, "El gateway debe indicar que la API no está disponible"
                 backend = start("DisasterLocation", api_port, api_env, log)
                 processes.append(backend)
                 wait_ready(api_url, "/api/desastres", backend)
-                assert len(request(gateway_url)[2]) == 2, "Los datos deben persistir tras reiniciar"
+                assert len(request(gateway_url)[2]) == 6, "Los datos deben persistir tras reiniciar"
+                status, _, replay = request(gateway_url, method="POST", data=payload, headers=operation)
+                assert status == 200 and replay == idempotent, "El reintento tras reiniciar debe recuperar el mismo ID"
                 with sqlite3.connect(database) as connection:
-                    assert connection.execute("SELECT COUNT(*) FROM Desastres").fetchone()[0] == 2
+                    assert connection.execute("SELECT COUNT(*) FROM Desastres").fetchone()[0] == 6
+                    try:
+                        connection.execute("UPDATE Desastres SET OperationId = ?", (operation["Idempotency-Key"].upper(),))
+                    except sqlite3.IntegrityError:
+                        connection.rollback()
+                    else:
+                        raise AssertionError("Falta el índice único de operación en SQLite")
                     try:
                         connection.execute("UPDATE Desastres SET Severidad = 6")
                     except sqlite3.IntegrityError:
                         pass
                     else:
                         raise AssertionError("Falta la restricción de severidad en SQLite")
-                print("OK: registro web/móvil, consulta, validación, gateway, CORS, DAL y persistencia tras reinicio.")
+                verify_schema_upgrade(folder, log, processes)
+                print("OK: web/móvil, validación, 201/200/409, concurrencia, gateway, CORS, índice único, reinicio y actualización sin pérdida de datos.")
             except Exception:
                 log.flush()
                 log.seek(0)

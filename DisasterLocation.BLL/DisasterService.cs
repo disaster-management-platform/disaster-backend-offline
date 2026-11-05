@@ -13,9 +13,15 @@ public sealed class DisasterService(IDisasterRepository repository)
         return disaster is null ? null : ToResponse(disaster);
     }
 
-    public async Task<DisasterResponse> CreateAsync(CreateDisasterRequest request, CancellationToken ct = default)
+    public async Task<CreateDisasterResult> CreateAsync(CreateDisasterRequest request,
+        string? idempotencyKey = null, CancellationToken ct = default)
     {
         var errors = new Dictionary<string, string[]>();
+        // Sin cabecera se admite el cliente web anterior, pero no se deduplican sus reenvíos.
+        var operationId = Guid.NewGuid();
+        if (idempotencyKey is not null
+            && (!Guid.TryParseExact(idempotencyKey, "D", out operationId) || operationId == Guid.Empty))
+            errors["Idempotency-Key"] = ["La clave debe ser un UUID válido, distinto de cero, con formato xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx."];
         ValidateText("nombre", request.Nombre, 120, errors);
         ValidateText("ubicacion", request.Ubicacion, 200, errors);
         ValidateText("descripcion", request.Descripcion, 2000, errors);
@@ -32,6 +38,7 @@ public sealed class DisasterService(IDisasterRepository repository)
 
         var disaster = new Disaster
         {
+            OperationId = operationId,
             Nombre = request.Nombre!.Trim(),
             Ubicacion = request.Ubicacion!.Trim(),
             Severidad = request.Severidad!.Value,
@@ -39,7 +46,22 @@ public sealed class DisasterService(IDisasterRepository repository)
             Latitud = request.Latitud!.Value,
             Longitud = request.Longitud!.Value
         };
-        return ToResponse(await repository.AddAsync(disaster, ct));
+        var existing = await repository.GetByOperationIdAsync(operationId, ct);
+        if (existing is not null)
+            return ResolveResult(disaster, new DisasterSaveResult(existing, Created: false));
+
+        return ResolveResult(disaster, await repository.AddAsync(disaster, ct));
+    }
+
+    private static CreateDisasterResult ResolveResult(Disaster requested, DisasterSaveResult result)
+    {
+        var saved = result.Disaster;
+        if (requested.Nombre != saved.Nombre || requested.Ubicacion != saved.Ubicacion
+            || requested.Severidad != saved.Severidad || requested.Descripcion != saved.Descripcion
+            || requested.Latitud != saved.Latitud || requested.Longitud != saved.Longitud)
+            throw new DisasterConflictException();
+
+        return new CreateDisasterResult(ToResponse(saved), result.Created);
     }
 
     private static void ValidateText(string field, string? value, int maxLength,

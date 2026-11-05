@@ -17,6 +17,7 @@ public sealed class DisasterDbContext(DbContextOptions<DisasterDbContext> option
             table.HasCheckConstraint("CK_Desastres_Longitud", "Longitud BETWEEN -180 AND 180");
         });
         disaster.HasKey(d => d.Id);
+        disaster.HasIndex(d => d.OperationId).IsUnique();
         disaster.Property(d => d.Nombre).IsRequired().HasMaxLength(120);
         disaster.Property(d => d.Ubicacion).IsRequired().HasMaxLength(200);
         disaster.Property(d => d.Descripcion).IsRequired().HasMaxLength(2000);
