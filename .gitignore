@@ -426,3 +426,12 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+**/bin/
+**/obj/
+**/App_Data/
+*.db
+*.db-shm
+*.db-wal
+.vs/
+__pycache__/
