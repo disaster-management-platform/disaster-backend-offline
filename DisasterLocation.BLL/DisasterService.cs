@@ -18,9 +18,9 @@ public sealed class DisasterService(IDisasterRepository repository)
     {
         var errors = new Dictionary<string, string[]>();
         // Sin cabecera se admite el cliente web anterior, pero no se deduplican sus reenvíos.
-        var operationId = Guid.NewGuid();
+        var clientRequestId = Guid.NewGuid();
         if (idempotencyKey is not null
-            && (!Guid.TryParseExact(idempotencyKey, "D", out operationId) || operationId == Guid.Empty))
+            && (!Guid.TryParseExact(idempotencyKey, "D", out clientRequestId) || clientRequestId == Guid.Empty))
             errors["Idempotency-Key"] = ["La clave debe ser un UUID válido, distinto de cero, con formato xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx."];
         ValidateText("nombre", request.Nombre, 120, errors);
         ValidateText("ubicacion", request.Ubicacion, 200, errors);
@@ -38,7 +38,7 @@ public sealed class DisasterService(IDisasterRepository repository)
 
         var disaster = new Disaster
         {
-            OperationId = operationId,
+            ClientRequestId = clientRequestId,
             Nombre = request.Nombre!.Trim(),
             Ubicacion = request.Ubicacion!.Trim(),
             Severidad = request.Severidad!.Value,
@@ -46,7 +46,7 @@ public sealed class DisasterService(IDisasterRepository repository)
             Latitud = request.Latitud!.Value,
             Longitud = request.Longitud!.Value
         };
-        var existing = await repository.GetByOperationIdAsync(operationId, ct);
+        var existing = await repository.GetByClientRequestIdAsync(clientRequestId, ct);
         if (existing is not null)
             return ResolveResult(disaster, new DisasterSaveResult(existing, Created: false));
 

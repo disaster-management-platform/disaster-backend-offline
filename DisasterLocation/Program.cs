@@ -12,7 +12,7 @@ builder.Services.AddDataAccess(
 
 var app = builder.Build();
 app.UseExceptionHandler();
-// El DAL se encarga de crear y acceder a la base de datos.
+// El DAL aplica las migraciones pendientes antes de recibir solicitudes.
 await app.Services.InitializeDataAccessAsync();
 if (app.Environment.IsDevelopment())
     app.MapOpenApi();
@@ -31,8 +31,16 @@ disasters.MapGet("/{id:int}", async (int id, DisasterService service, Cancellati
 disasters.MapPost("/", async (HttpRequest httpRequest, CreateDisasterRequest request,
     DisasterService service, CancellationToken ct) =>
 {
-    var idempotencyKey = httpRequest.Headers.TryGetValue("Idempotency-Key", out var values)
-        ? values.ToString() : null;
+    string? idempotencyKey = null;
+    if (httpRequest.Headers.TryGetValue("Idempotency-Key", out var values))
+    {
+        if (values.Count != 1)
+            return Results.ValidationProblem(new Dictionary<string, string[]>
+            {
+                ["Idempotency-Key"] = ["Envía una sola clave de idempotencia por solicitud."]
+            });
+        idempotencyKey = values[0];
+    }
     try
     {
         var result = await service.CreateAsync(request, idempotencyKey, ct);

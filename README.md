@@ -57,14 +57,25 @@ La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus
 1. La API lee `Idempotency-Key`. La BLL valida el UUID y el reporte, y consulta si esa operación ya existe.
 2. La inyección de dependencias resuelve esa interfaz con `DisasterRepository`, implementado en el DAL.
 3. Si la operación existe, la BLL compara los datos normalizados y devuelve el registro, o un conflicto si cambiaron.
-4. Si no existe, el repositorio guarda con EF Core. Un índice único sobre `OperationId` evita duplicados incluso si llegan dos solicitudes al mismo tiempo. Si otra solicitud guardó primero, se recupera su registro y la BLL también compara el contenido.
+4. Si no existe, el repositorio guarda con EF Core. Un índice único sobre `ClientRequestId` evita duplicados incluso si llegan dos solicitudes al mismo tiempo. Si otra solicitud guardó primero, se recupera su registro y la BLL también compara el contenido.
 5. La API responde `201 Created` al crear, `200 OK` al recuperar o `409 Conflict` si se reutilizó la clave con otros datos. El gateway conserva estas respuestas.
 
 Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y SQLite está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
 
 La base se crea automáticamente en `DisasterLocation/App_Data/disasters.db`. Los registros sobreviven a reinicios. La conexión se configura en `DisasterLocation/appsettings.json`, sección `ConnectionStrings:Disasters`; una ruta relativa se resuelve desde el directorio de la API.
 
-Para mantenerlo sencillo se usa `EnsureCreatedAsync` y una actualización puntual en `DependencyInjection.cs`: si la tabla anterior no tiene `OperationId`, agrega la columna y crea el índice único dentro de una transacción. Los datos anteriores conservan su ID y quedan con la clave en `NULL`. No hay que borrar la base. Esta actualización puede ejecutarse de nuevo; para futuros cambios de esquema conviene incorporar migraciones.
+La API aplica las migraciones de EF Core al iniciar, mediante `MigrateAsync`. Están en `DisasterLocation.DAL/Migrations` y cubren el esquema original, la incorporación de `OperationId` de la versión anterior y su cambio de nombre a `ClientRequestId`, con índice único. El cambio de nombre conserva los UUID que ya estaban guardados.
+
+Si la base se creó con `EnsureCreated`, `LegacySchemaBaseline` reconoce el esquema anterior y registra las migraciones que ya representa antes de aplicar las pendientes. No hay que borrar la base: los reportes conservan sus IDs y las claves existentes. Los reportes históricos que nunca tuvieron una clave quedan con `ClientRequestId` en `NULL`. Los siguientes arranques usan el historial de EF para aplicar solo lo que falta.
+
+Para agregar otro cambio de esquema:
+
+```bash
+dotnet tool restore
+dotnet ef migrations add NombreDelCambio --project DisasterLocation.DAL
+```
+
+La herramienta `dotnet-ef` está fijada a la misma versión que EF Core en `dotnet-tools.json`. La fábrica de diseño permite generar las migraciones sin iniciar la API. Al ejecutar la API se aplican sobre la conexión configurada en `appsettings.json`.
 
 ## Contrato compartido por web y móvil
 
@@ -154,6 +165,6 @@ dotnet build
 python3 scripts/smoke_test.py
 ```
 
-La prueba inicia API y gateway en puertos temporales y usa bases temporales. Comprueba el registro web y móvil, validación, reintentos `201/200`, conflictos `409`, solicitudes concurrentes, CORS y el índice único. También comprueba que un reintento conserva su ID tras reiniciar la API y que una base con el esquema anterior se actualiza sin perder registros. Al terminar detiene los procesos y elimina sus datos de prueba.
+La prueba inicia API y gateway en puertos temporales y usa bases temporales. Comprueba el registro web y móvil, validación, reintentos `201/200`, conflictos `409`, solicitudes concurrentes, CORS y el índice único. También comprueba que un reintento conserva su ID tras reiniciar la API y que las bases anteriores, con y sin `OperationId`, se migran sin perder registros ni UUID. Al terminar detiene los procesos y elimina sus datos de prueba.
 
 Referencias: [YARP](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/getting-started?view=aspnetcore-10.0), [EF Core con SQLite](https://learn.microsoft.com/en-us/training/modules/build-web-api-minimal-database/), [Leaflet 1.9](https://leafletjs.com/examples-v1/quick-start/).

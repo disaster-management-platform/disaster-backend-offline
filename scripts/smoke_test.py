@@ -5,6 +5,7 @@ No modifica los datos de la aplicación ni usa sus puertos de desarrollo.
 """
 import json
 from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPConnection
 import os
 from pathlib import Path
 import socket
@@ -15,6 +16,7 @@ import time
 import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -91,6 +93,21 @@ def verify_idempotency(base, payload):
         status, _, problem = request(base, method="POST", data=payload,
             headers={"Idempotency-Key": invalid_key})
         assert status == 400 and "Idempotency-Key" in problem["errors"], (invalid_key, problem)
+    address = urlsplit(base)
+    connection = HTTPConnection(address.hostname, address.port, timeout=5)
+    try:
+        body = json.dumps(payload).encode()
+        connection.putrequest("POST", "/api/desastres")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.putheader("Idempotency-Key", key)
+        connection.putheader("Idempotency-Key", key)
+        connection.endheaders(body)
+        response = connection.getresponse()
+        problem = json.loads(response.read())
+        assert response.status == 400 and "Idempotency-Key" in problem["errors"]
+    finally:
+        connection.close()
     # Una clave conocida tampoco permite omitir la validación del cuerpo.
     assert request(base, method="POST", data={**payload, "severidad": 0}, headers=operation)[0] == 400
 
@@ -115,8 +132,9 @@ def verify_idempotency(base, payload):
     return operation, saved
 
 
-def verify_schema_upgrade(folder, log, processes):
-    database = Path(folder) / "legacy.db"
+def verify_schema_upgrade(folder, log, processes, with_operation_id=False):
+    database = Path(folder) / ("legacy-operation.db" if with_operation_id else "legacy.db")
+    previous_key = str(uuid.uuid4())
     with sqlite3.connect(database) as connection:
         connection.executescript('''
             CREATE TABLE Desastres (
@@ -131,6 +149,12 @@ def verify_schema_upgrade(folder, log, processes):
             VALUES ('Histórico 1', 'Bogotá', 1, 'Antes de la actualización', 0, 0),
                    ('Histórico 2', 'Cali', 2, 'Antes de la actualización', 1, 1);
         ''')
+        if with_operation_id:
+            connection.executescript('''
+                ALTER TABLE Desastres ADD COLUMN OperationId TEXT NULL;
+                CREATE UNIQUE INDEX IX_Desastres_OperationId ON Desastres (OperationId);
+            ''')
+            connection.execute("UPDATE Desastres SET OperationId = ? WHERE Id = 1", (previous_key.upper(),))
     port = free_port()
     base = f"http://127.0.0.1:{port}"
     payload = {"nombre": "Reporte nuevo", "ubicacion": "Bogotá", "severidad": 3,
@@ -146,6 +170,14 @@ def verify_schema_upgrade(folder, log, processes):
         historical = [row for row in records if row["id"] in (1, 2)]
         assert {row["nombre"] for row in historical} == {"Histórico 1", "Histórico 2"}
         assert len(records) == 2 + attempt
+        if with_operation_id:
+            previous = next(row for row in historical if row["id"] == 1)
+            previous_body = {key: value for key, value in previous.items() if key != "id"}
+            status, _, replay = request(base, method="POST", data=previous_body,
+                headers={"Idempotency-Key": previous_key})
+            assert status == 200 and replay == previous, "La migración debe conservar las claves existentes"
+            assert request(base, method="POST", data={**previous_body, "nombre": "Otro nombre"},
+                headers={"Idempotency-Key": previous_key})[0] == 409
         status, _, replay = request(base, method="POST", data=payload, headers=operation)
         if attempt == 0:
             assert status == 201 and replay["id"] == 3
@@ -154,8 +186,12 @@ def verify_schema_upgrade(folder, log, processes):
             assert status == 200 and replay == saved
         stop(backend)
     with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM Desastres WHERE OperationId IS NULL").fetchone()[0] == 2
-        assert any(row[1] == "IX_Desastres_OperationId" and row[2] == 1
+        expected_nulls = 1 if with_operation_id else 2
+        assert connection.execute("SELECT COUNT(*) FROM Desastres WHERE ClientRequestId IS NULL").fetchone()[0] == expected_nulls
+        columns = {row[1] for row in connection.execute("PRAGMA table_info('Desastres')")}
+        assert "ClientRequestId" in columns and "OperationId" not in columns
+        assert connection.execute('SELECT COUNT(*) FROM "__EFMigrationsHistory"').fetchone()[0] == 3
+        assert any(row[1] == "IX_Desastres_ClientRequestId" and row[2] == 1
                    for row in connection.execute("PRAGMA index_list('Desastres')"))
 
 
@@ -248,8 +284,9 @@ def main():
                 assert status == 200 and replay == idempotent, "El reintento tras reiniciar debe recuperar el mismo ID"
                 with sqlite3.connect(database) as connection:
                     assert connection.execute("SELECT COUNT(*) FROM Desastres").fetchone()[0] == 6
+                    assert connection.execute('SELECT COUNT(*) FROM "__EFMigrationsHistory"').fetchone()[0] == 3
                     try:
-                        connection.execute("UPDATE Desastres SET OperationId = ?", (operation["Idempotency-Key"].upper(),))
+                        connection.execute("UPDATE Desastres SET ClientRequestId = ?", (operation["Idempotency-Key"].upper(),))
                     except sqlite3.IntegrityError:
                         connection.rollback()
                     else:
@@ -261,7 +298,8 @@ def main():
                     else:
                         raise AssertionError("Falta la restricción de severidad en SQLite")
                 verify_schema_upgrade(folder, log, processes)
-                print("OK: web/móvil, validación, 201/200/409, concurrencia, gateway, CORS, índice único, reinicio y actualización sin pérdida de datos.")
+                verify_schema_upgrade(folder, log, processes, with_operation_id=True)
+                print("OK: web/móvil, validación, 201/200/409, concurrencia, gateway, CORS, índice único, reinicio y migraciones sin pérdida de datos ni UUID.")
             except Exception:
                 log.flush()
                 log.seek(0)

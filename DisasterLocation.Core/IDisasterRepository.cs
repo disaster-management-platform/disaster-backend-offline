@@ -5,7 +5,7 @@ public interface IDisasterRepository
 {
     Task<IReadOnlyList<Disaster>> GetAllAsync(CancellationToken ct = default);
     Task<Disaster?> GetByIdAsync(int id, CancellationToken ct = default);
-    Task<Disaster?> GetByOperationIdAsync(Guid operationId, CancellationToken ct = default);
+    Task<Disaster?> GetByClientRequestIdAsync(Guid clientRequestId, CancellationToken ct = default);
     Task<DisasterSaveResult> AddAsync(Disaster disaster, CancellationToken ct = default);
 }
 
