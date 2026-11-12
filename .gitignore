@@ -435,3 +435,4 @@ FodyWeavers.xsd
 *.db-wal
 .vs/
 __pycache__/
+*.idea/
