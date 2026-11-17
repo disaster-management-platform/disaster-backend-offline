@@ -118,7 +118,8 @@ def verify_idempotency(base, payload):
     operation = {"Idempotency-Key": key, "User-Agent": "okhttp/Android"}
     status, headers, saved = request(base, method="POST", data=payload, headers=operation)
     assert status == 201 and headers["Location"] == f'/api/desastres/{saved["id"]}'
-    assert set(saved) == set(payload) | {"id"}, "El JSON debe conservar el contrato de Android"
+    assert set(saved) == set(payload) | {"id", "radio", "phase", "version"}
+    assert saved["radio"] is None and saved["phase"] == "Registered" and saved["version"] == 1
     for retry_key in [key, key.upper()]:
         status, _, replay = request(base, method="POST", data=payload,
             headers={"Idempotency-Key": retry_key})
@@ -290,6 +291,20 @@ def main():
                         connection.rollback()
                     else:
                         raise AssertionError("Falta la restricción de severidad en PostgreSQL")
+                assert request(gateway_url, method="POST", data={**payload, "radio": None}, headers=operation)[0] == 200
+                assert request(gateway_url, method="POST", data={**payload, "radio": 500}, headers=operation)[0] == 409
+                radio_key = {"Idempotency-Key": str(uuid.uuid4())}
+                radio_body = {**payload, "radio": 500}
+                status, _, with_radius = request(gateway_url, method="POST", data=radio_body, headers=radio_key)
+                assert status == 201 and with_radius["radio"] == 500
+                assert request(gateway_url, method="POST", data=radio_body, headers=radio_key)[0] == 200
+                for conflicting in [payload, {**payload, "radio": None}, {**payload, "radio": 501}]:
+                    assert request(gateway_url, method="POST", data=conflicting, headers=radio_key)[0] == 409
+                for invalid_radius in [0, -1, 1_000_001, "invalid"]:
+                    assert request(gateway_url, method="POST", data={**payload, "radio": invalid_radius})[0] == 400
+                assert request(gateway_url, f"/api/desastres/{with_radius['id']}")[2] == with_radius
+                assert request(gateway_url, f"/api/desastres/{with_radius['id']}/fase", "PUT",
+                    {"phase": "Response", "expectedVersion": 1})[0] == 401
                 print("OK: web/móvil, validación, 201/200/409, concurrencia, gateway, CORS, índice único, reinicio y migraciones sin pérdida de datos ni UUID.")
             except Exception:
                 log.flush()

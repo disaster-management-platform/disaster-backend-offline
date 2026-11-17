@@ -2,6 +2,9 @@ using DisasterLocation.BLL;
 using DisasterLocation.Core;
 using DisasterLocation.DAL;
 using Platform.DAL;
+using Platform.Security;
+using Reconstruction.Application.Ports;
+using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
 var connectionString = builder.Configuration.GetConnectionString("Disasters")
@@ -12,12 +15,22 @@ if (builder.Configuration.GetValue<bool>("Database:Migrate"))
     return;
 }
 builder.Services.AddOpenApi();
+builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddProblemDetails();
 builder.Services.AddScoped<DisasterService>();
 builder.Services.AddDataAccess(connectionString);
+builder.Services.AddPlatformSecurity(builder.Configuration, builder.Environment);
 
 var app = builder.Build();
-app.UseExceptionHandler();
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseExceptionHandler(handler => handler.Run(async context =>
+{
+    var exception = context.Features.Get<Microsoft.AspNetCore.Diagnostics.IExceptionHandlerFeature>()?.Error;
+    var status = exception is BadHttpRequestException request ? request.StatusCode : 500;
+    await Results.Problem(statusCode: status, title: status == 400 ? "Solicitud inválida" : "Error interno",
+        detail: status == 400 ? "Revise los tipos y el formato JSON de la solicitud." : "Consulte el registro del servidor.").ExecuteAsync(context);
+}));
 if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 
@@ -63,4 +76,17 @@ disasters.MapPost("/", async (HttpRequest httpRequest, CreateDisasterRequest req
     }
 }).WithSummary("Registra un desastre con sus coordenadas.");
 
+disasters.MapPut("/{id:int}/fase", async (int id, ChangeDisasterPhaseRequest request, HttpContext http,
+    DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+{
+    if (!access.CanAccess(id)) return Results.Forbid();
+    try
+    {
+        var result = await service.ChangePhaseAsync(id, request, PlatformSecurity.Actor(http.User), ct);
+        return result is null ? Results.NotFound() : Results.Ok(result);
+    }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+    catch (DisasterConflictException) { return Results.Conflict(new { detail = "El desastre cambió; actualice su versión." }); }
+}).RequireAuthorization(PlatformSecurity.Write);
 app.Run();
+public partial class Program { }

@@ -10,6 +10,7 @@
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14" />
     <ProjectReference Include="../DisasterLocation.BLL/DisasterLocation.BLL.csproj" />
     <PackageReference Include="DisasterPlatform.DAL" Version="2.0.1" />
+    <PackageReference Include="DisasterPlatform.Security" Version="1.0.0" />
   </ItemGroup>
 
   <ItemGroup>

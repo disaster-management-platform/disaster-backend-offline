@@ -9,6 +9,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DisasterLocation.Core", "Di
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DisasterLocation.BLL", "DisasterLocation.BLL\DisasterLocation.BLL.csproj", "{31E27CC9-2BA5-4C3B-A8D0-2A7C59CD87FE}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DisasterLocation.Tests", "DisasterLocation.Tests\DisasterLocation.Tests.csproj", "{D61919DD-3383-4C52-A51B-8683EC81C13F}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -55,6 +57,18 @@ Global
 		{31E27CC9-2BA5-4C3B-A8D0-2A7C59CD87FE}.Release|x64.Build.0 = Release|Any CPU
 		{31E27CC9-2BA5-4C3B-A8D0-2A7C59CD87FE}.Release|x86.ActiveCfg = Release|Any CPU
 		{31E27CC9-2BA5-4C3B-A8D0-2A7C59CD87FE}.Release|x86.Build.0 = Release|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Debug|x64.Build.0 = Debug|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Debug|x86.Build.0 = Debug|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Release|x64.ActiveCfg = Release|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Release|x64.Build.0 = Release|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Release|x86.ActiveCfg = Release|Any CPU
+		{D61919DD-3383-4C52-A51B-8683EC81C13F}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

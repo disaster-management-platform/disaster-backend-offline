@@ -66,7 +66,7 @@ La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus
 
 Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y PostgreSQL está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
 
-La persistencia se distribuye mediante `DisasterPlatform.DAL 2.0.1`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. Esta API conserva su contrato HTTP original.
+La persistencia se distribuye mediante `DisasterPlatform.DAL 2.0.1`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. La API conserva los campos originales y añade `radio` nullable, `phase` y `version` a las respuestas. `radio` es opcional en la creación y, cuando se informa, debe ser mayor que cero y no superar 1.000.000 metros.
 
 Las migraciones se ejecutan explícitamente con una conexión administrativa separada. Con su archivo protegido indicado en `MIGRATION_CONNECTION_FILE`:
 
@@ -77,7 +77,7 @@ ConnectionStrings__Disasters="$(cat "$MIGRATION_CONNECTION_FILE")" \
 
 Este comando aplica las cadenas PostgreSQL de ambos contextos del DAL y termina sin abrir el servidor HTTP. El arranque normal no aplica migraciones ni crea archivos locales. No se reutilizan historiales de SQLite.
 
-En Supabase, las credenciales actuales de las dos APIs de desastres son de solo lectura; la activación de un propietario de escritura sigue pendiente. Utiliza PostgreSQL local aislado para las pruebas de escritura.
+Este servicio es el único escritor del esquema `disasters`. Reconstrucción lo consulta mediante HTTP. Las credenciales administrativas se reservan para migraciones y las APIs utilizan roles propios.
 
 Para agregar otro cambio de esquema, desde el repositorio `disaster-platform-dal`:
 
@@ -87,6 +87,8 @@ dotnet ef migrations add NombreDelCambio --project DisasterPlatform.DAL --contex
 ```
 
 La herramienta `dotnet-ef` está fijada a la misma versión que EF Core en `dotnet-tools.json`. La fábrica de diseño utiliza `ConnectionStrings__Disasters` y permite generar las migraciones sin iniciar la API. Los cambios se aplican con el comando explícito de migración y credenciales administrativas; la API utiliza sus propias credenciales de ejecución.
+
+La seguridad común se consume mediante `DisasterPlatform.Security 1.0.0`. GET y POST conservan el acceso utilizado por los clientes existentes. `PUT /api/desastres/{id}/fase` recibe `phase` y `expectedVersion`, requiere JWT con `sub`, `organization_id`, rol `reconstruction.write` y acceso mediante `disaster_id`. Se conservan Registered → Response → Recovery → Closed, concurrencia optimista y auditoría transaccional. `Security__Authority` y `Security__Audience` configuran el proveedor existente; `Security__LocalDemo=true` solo se admite explícitamente en Development.
 
 ## Contrato compartido por web y móvil
 
@@ -109,7 +111,7 @@ Solicitud de registro, con la cabecera `Idempotency-Key: 550e8400-e29b-41d4-a716
 }
 ```
 
-La respuesta tiene los mismos campos y un `id` entero generado por PostgreSQL. Todos los campos de registro son obligatorios. Límites: nombre 120 caracteres, ubicación 200, descripción 2000; severidad entera de 1 a 5; latitud de −90 a 90; longitud de −180 a 180. Los errores de negocio incluyen un objeto `errors` con mensajes por campo en formato Problem Details.
+La respuesta incluye los campos originales, un `id` entero generado por PostgreSQL, `radio` nullable, `phase` y `version`. Todos los campos de registro son obligatorios. Límites: nombre 120 caracteres, ubicación 200, descripción 2000; severidad entera de 1 a 5; latitud de −90 a 90; longitud de −180 a 180. Los errores de negocio incluyen un objeto `errors` con mensajes por campo en formato Problem Details.
 
 Hay solicitudes listas para ejecutar en [DisasterLocation.http](DisasterLocation/DisasterLocation.http). El documento OpenAPI está en http://localhost:5156/openapi/v1.json cuando la API corre en desarrollo.
 
@@ -141,7 +143,7 @@ Un `400` requiere corregir los datos. Un `409` indica que la clave ya pertenece 
 
 Con Retrofit, `@POST("desastres")` funciona si el `baseUrl` termina en `/api/`, por ejemplo `http://IP_DEL_COMPUTADOR:5080/api/`. El JSON de respuesta sigue teniendo los mismos campos, incluido el `id` entero, por lo que sirve para `DisasterInfoDto`.
 
-La cabecera acepta un UUID con guiones, distinto de cero, sin distinguir mayúsculas. Si se envía vacía o con un formato inválido, se responde `400`. Para conservar la compatibilidad con la web actual, las solicitudes sin cabecera siguen creando registros, pero sus reenvíos no se deduplican. La comparación contempla los seis campos del reporte después de quitar los espacios al inicio y al final de los textos.
+La cabecera acepta un UUID con guiones, distinto de cero, sin distinguir mayúsculas. Si se envía vacía o con un formato inválido, se responde `400`. Para conservar la compatibilidad con la web actual, las solicitudes sin cabecera siguen creando registros, pero sus reenvíos no se deduplican. La comparación contempla los seis campos originales y `radio`, después de quitar los espacios al inicio y al final de los textos. Omitir `radio` equivale a enviarlo como `null`. Reutilizar la misma clave con un radio diferente, incluido cambiar entre `null` y un valor, devuelve `409` y no modifica el registro anterior.
 
 Puedes comprobarlo con:
 
@@ -176,7 +178,9 @@ Las pruebas requieren `psycopg2` y un PostgreSQL local accesible por socket Unix
 
 ```bash
 export TEST_POSTGRES_DSN="host=${PGSOCKET:?Configura el socket PostgreSQL local} port=5432 dbname=postgres user=$(id -un)"
+export TEST_POSTGRES_CONNECTION="Host=$PGSOCKET;Port=5432;Database=postgres;Username=$(id -un)"
 dotnet build
+dotnet test --no-build
 dotnet build ../disaster-api-gateway/DisasterLocation.Gateway.sln
 python3 scripts/smoke_test.py
 ```

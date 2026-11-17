@@ -33,6 +33,8 @@ public sealed class DisasterService(IDisasterRepository repository)
         if (request.Longitud is null || !double.IsFinite(request.Longitud.Value)
             || request.Longitud is < -180 or > 180)
             errors["longitud"] = ["La longitud es obligatoria y debe estar entre -180 y 180."];
+        if (request.Radio is not null && (!double.IsFinite(request.Radio.Value) || request.Radio <= 0 || request.Radio > 1_000_000))
+            errors["radio"] = ["El radio debe estar entre 0 y 1.000.000 metros."];
         if (errors.Count > 0)
             throw new DisasterValidationException(errors);
 
@@ -44,7 +46,8 @@ public sealed class DisasterService(IDisasterRepository repository)
             Severidad = request.Severidad!.Value,
             Descripcion = request.Descripcion!.Trim(),
             Latitud = request.Latitud!.Value,
-            Longitud = request.Longitud!.Value
+            Longitud = request.Longitud!.Value,
+            Radio = request.Radio
         };
         var existing = await repository.GetByClientRequestIdAsync(clientRequestId, ct);
         if (existing is not null)
@@ -53,12 +56,26 @@ public sealed class DisasterService(IDisasterRepository repository)
         return ResolveResult(disaster, await repository.AddAsync(disaster, ct));
     }
 
+    public async Task<DisasterResponse?> ChangePhaseAsync(int id, ChangeDisasterPhaseRequest request,
+        string actor, CancellationToken ct)
+    {
+        var disaster = await repository.GetByIdAsync(id, ct);
+        if (disaster is null) return null;
+        if (request.ExpectedVersion != disaster.Version) throw new DisasterConflictException();
+        if (!Enum.IsDefined(request.Phase) || (int)request.Phase != (int)disaster.Phase + 1)
+            throw new DisasterValidationException(new Dictionary<string, string[]>
+            { ["phase"] = ["Las fases siguen el orden Registered → Response → Recovery → Closed."] });
+        if (!await repository.ChangePhaseAsync(id, disaster.Phase, request.Phase, request.ExpectedVersion, actor, ct))
+            throw new DisasterConflictException();
+        return await GetByIdAsync(id, ct);
+    }
+
     private static CreateDisasterResult ResolveResult(Disaster requested, DisasterSaveResult result)
     {
         var saved = result.Disaster;
         if (requested.Nombre != saved.Nombre || requested.Ubicacion != saved.Ubicacion
             || requested.Severidad != saved.Severidad || requested.Descripcion != saved.Descripcion
-            || requested.Latitud != saved.Latitud || requested.Longitud != saved.Longitud)
+            || requested.Latitud != saved.Latitud || requested.Longitud != saved.Longitud || requested.Radio != saved.Radio)
             throw new DisasterConflictException();
 
         return new CreateDisasterResult(ToResponse(saved), result.Created);
@@ -75,5 +92,5 @@ public sealed class DisasterService(IDisasterRepository repository)
 
     private static DisasterResponse ToResponse(Disaster disaster) => new(
         disaster.Id, disaster.Nombre, disaster.Ubicacion, disaster.Severidad,
-        disaster.Descripcion, disaster.Latitud, disaster.Longitud);
+        disaster.Descripcion, disaster.Latitud, disaster.Longitud, disaster.Radio, disaster.Phase.ToString(), disaster.Version);
 }
