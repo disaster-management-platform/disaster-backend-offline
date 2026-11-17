@@ -1,4 +1,4 @@
-"""Prueba real Gateway -> API -> BLL -> DAL -> SQLite, con base temporal.
+"""Prueba real Gateway -> API -> BLL -> DAL -> PostgreSQL, con base temporal.
 
 Ejecutar desde la raíz:
 dotnet build && dotnet build ../disaster-api-gateway/DisasterLocation.Gateway.sln
@@ -11,7 +11,9 @@ from http.client import HTTPConnection
 import os
 from pathlib import Path
 import socket
-import sqlite3
+import psycopg2
+import psycopg2.sql
+from contextlib import closing, contextmanager
 import subprocess
 import tempfile
 import time
@@ -21,6 +23,41 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def test_database():
+    settings = psycopg2.extensions.parse_dsn(os.environ["TEST_POSTGRES_DSN"])
+    if not settings.get("host", "").startswith("/"):
+        raise ValueError("Las pruebas requieren un socket PostgreSQL local, nunca Supabase.")
+    name = "platform_test_" + uuid.uuid4().hex
+    with closing(psycopg2.connect(**settings)) as admin:
+        admin.autocommit = True
+        with admin.cursor() as cursor:
+            cursor.execute(psycopg2.sql.SQL("CREATE DATABASE {}").format(psycopg2.sql.Identifier(name)))
+        try:
+            settings["dbname"] = name
+            settings["options"] = "-csearch_path=disasters,reconstruction,public"
+            yield psycopg2.extensions.make_dsn(**settings)
+        finally:
+            with admin.cursor() as cursor:
+                cursor.execute(psycopg2.sql.SQL("DROP DATABASE {} WITH (FORCE)").format(psycopg2.sql.Identifier(name)))
+
+
+def postgres_connection_string(database):
+    settings = psycopg2.extensions.parse_dsn(database)
+    def escape(value):
+        return '"' + value.replace('"', '""') + '"'
+    return ";".join(key + "=" + escape(settings[source]) for key, source in
+        [("Host", "host"), ("Port", "port"), ("Database", "dbname"), ("Username", "user"), ("Password", "password")]
+        if source in settings)
+
+
+def migrate_database(database, log):
+    project = ROOT / "DisasterLocation"
+    subprocess.run(["dotnet", str(project / "bin/Debug/net10.0/DisasterLocation.dll"), "--Database:Migrate=true"],
+        cwd=project, env={**os.environ, "ConnectionStrings__Disasters": postgres_connection_string(database)},
+        stdout=log, stderr=log, check=True, timeout=60)
 
 
 def free_port():
@@ -135,82 +172,16 @@ def verify_idempotency(base, payload):
     return operation, saved
 
 
-def verify_schema_upgrade(folder, log, processes, with_operation_id=False):
-    database = Path(folder) / ("legacy-operation.db" if with_operation_id else "legacy.db")
-    previous_key = str(uuid.uuid4())
-    with sqlite3.connect(database) as connection:
-        connection.executescript('''
-            CREATE TABLE Desastres (
-                Id INTEGER NOT NULL CONSTRAINT PK_Desastres PRIMARY KEY AUTOINCREMENT,
-                Nombre TEXT NOT NULL, Ubicacion TEXT NOT NULL, Severidad INTEGER NOT NULL,
-                Descripcion TEXT NOT NULL, Latitud REAL NOT NULL, Longitud REAL NOT NULL,
-                CONSTRAINT CK_Desastres_Severidad CHECK (Severidad BETWEEN 1 AND 5),
-                CONSTRAINT CK_Desastres_Latitud CHECK (Latitud BETWEEN -90 AND 90),
-                CONSTRAINT CK_Desastres_Longitud CHECK (Longitud BETWEEN -180 AND 180)
-            );
-            INSERT INTO Desastres (Nombre, Ubicacion, Severidad, Descripcion, Latitud, Longitud)
-            VALUES ('Histórico 1', 'Bogotá', 1, 'Antes de la actualización', 0, 0),
-                   ('Histórico 2', 'Cali', 2, 'Antes de la actualización', 1, 1);
-        ''')
-        if with_operation_id:
-            connection.executescript('''
-                ALTER TABLE Desastres ADD COLUMN OperationId TEXT NULL;
-                CREATE UNIQUE INDEX IX_Desastres_OperationId ON Desastres (OperationId);
-            ''')
-            connection.execute("UPDATE Desastres SET OperationId = ? WHERE Id = 1", (previous_key.upper(),))
-    port = free_port()
-    base = f"http://127.0.0.1:{port}"
-    payload = {"nombre": "Reporte nuevo", "ubicacion": "Bogotá", "severidad": 3,
-               "descripcion": "Después de la actualización", "latitud": 4.711, "longitud": -74.0721}
-    operation = {"Idempotency-Key": str(uuid.uuid4())}
-    saved = None
-    for attempt in range(2):
-        backend = start("DisasterLocation", port,
-            {"ConnectionStrings__Disasters": f"Data Source={database}"}, log)
-        processes.append(backend)
-        wait_ready(base, "/api/desastres", backend)
-        records = request(base)[2]
-        historical = [row for row in records if row["id"] in (1, 2)]
-        assert {row["nombre"] for row in historical} == {"Histórico 1", "Histórico 2"}
-        assert len(records) == 2 + attempt
-        if with_operation_id:
-            previous = next(row for row in historical if row["id"] == 1)
-            previous_body = {key: value for key, value in previous.items() if key != "id"}
-            status, _, replay = request(base, method="POST", data=previous_body,
-                headers={"Idempotency-Key": previous_key})
-            assert status == 200 and replay == previous, "La migración debe conservar las claves existentes"
-            assert request(base, method="POST", data={**previous_body, "nombre": "Otro nombre"},
-                headers={"Idempotency-Key": previous_key})[0] == 409
-        status, _, replay = request(base, method="POST", data=payload, headers=operation)
-        if attempt == 0:
-            assert status == 201 and replay["id"] == 3
-            saved = replay
-        else:
-            assert status == 200 and replay == saved
-        stop(backend)
-    with sqlite3.connect(database) as connection:
-        expected_nulls = 1 if with_operation_id else 2
-        assert connection.execute("SELECT COUNT(*) FROM Desastres WHERE ClientRequestId IS NULL").fetchone()[0] == expected_nulls
-        columns = {row[1] for row in connection.execute("PRAGMA table_info('Desastres')")}
-        assert "ClientRequestId" in columns and "OperationId" not in columns
-        assert {"Radio", "Phase", "Version"}.issubset(columns)
-        assert connection.execute("SELECT COUNT(*) FROM Desastres WHERE Phase != 0 OR Version != 1 OR Radio IS NOT NULL").fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM DisasterPhaseAudit").fetchone()[0] == 0
-        assert connection.execute('SELECT COUNT(*) FROM "__EFMigrationsHistory"').fetchone()[0] == 4
-        assert any(row[1] == "IX_Desastres_ClientRequestId" and row[2] == 1
-                   for row in connection.execute("PRAGMA index_list('Desastres')"))
-
-
 def main():
     processes = []
-    with tempfile.TemporaryDirectory(prefix="disasters-test-") as folder:
-        database = Path(folder) / "test.db"
+    with tempfile.TemporaryDirectory(prefix="disasters-test-") as folder, test_database() as database:
         api_port, gateway_port = free_port(), free_port()
         api_url = f"http://127.0.0.1:{api_port}"
         gateway_url = f"http://127.0.0.1:{gateway_port}"
-        api_env = {"ConnectionStrings__Disasters": f"Data Source={database}"}
+        api_env = {"ConnectionStrings__Disasters": postgres_connection_string(database)}
         with open(Path(folder) / "processes.log", "w+") as log:
             try:
+                migrate_database(database, log)
                 backend = start("DisasterLocation", api_port, api_env, log)
                 processes.append(backend)
                 wait_ready(api_url, "/api/desastres", backend)
@@ -280,31 +251,45 @@ def main():
 
                 operation, idempotent = verify_idempotency(gateway_url, payload)
 
+                replica_port = free_port()
+                replica_url = f"http://127.0.0.1:{replica_port}"
+                replica = start("DisasterLocation", replica_port, api_env, log)
+                processes.append(replica)
+                wait_ready(replica_url, "/api/desastres", replica)
+                assert request(replica_url)[2] == request(gateway_url)[2]
+                shared_key = str(uuid.uuid4())
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(lambda base: request(base, method="POST", data=payload,
+                        headers={"Idempotency-Key": shared_key}), [gateway_url, replica_url]))
+                assert sorted(result[0] for result in results) == [200, 201], results
+                assert results[0][2] == results[1][2]
+                stop(replica)
+
                 stop(backend)
                 assert request(gateway_url)[0] == 502, "El gateway debe indicar que la API no está disponible"
                 backend = start("DisasterLocation", api_port, api_env, log)
                 processes.append(backend)
                 wait_ready(api_url, "/api/desastres", backend)
-                assert len(request(gateway_url)[2]) == 6, "Los datos deben persistir tras reiniciar"
+                assert len(request(gateway_url)[2]) == 7, "Los datos deben persistir tras reiniciar"
                 status, _, replay = request(gateway_url, method="POST", data=payload, headers=operation)
                 assert status == 200 and replay == idempotent, "El reintento tras reiniciar debe recuperar el mismo ID"
-                with sqlite3.connect(database) as connection:
-                    assert connection.execute("SELECT COUNT(*) FROM Desastres").fetchone()[0] == 6
-                    assert connection.execute('SELECT COUNT(*) FROM "__EFMigrationsHistory"').fetchone()[0] == 4
+                with closing(psycopg2.connect(database)) as connection, connection.cursor() as cursor:
+                    cursor.execute('SELECT COUNT(*) FROM "Desastres"')
+                    assert cursor.fetchone()[0] == 7
+                    cursor.execute('SELECT COUNT(*) FROM disasters."__EFMigrationsHistory_Disaster"')
+                    assert cursor.fetchone()[0] == 1
                     try:
-                        connection.execute("UPDATE Desastres SET ClientRequestId = ?", (operation["Idempotency-Key"].upper(),))
-                    except sqlite3.IntegrityError:
+                        cursor.execute('UPDATE "Desastres" SET "ClientRequestId" = %s', (operation["Idempotency-Key"].upper(),))
+                    except psycopg2.IntegrityError:
                         connection.rollback()
                     else:
-                        raise AssertionError("Falta el índice único de operación en SQLite")
+                        raise AssertionError("Falta el índice único de operación en PostgreSQL")
                     try:
-                        connection.execute("UPDATE Desastres SET Severidad = 6")
-                    except sqlite3.IntegrityError:
-                        pass
+                        cursor.execute('UPDATE "Desastres" SET "Severidad" = 6')
+                    except psycopg2.IntegrityError:
+                        connection.rollback()
                     else:
-                        raise AssertionError("Falta la restricción de severidad en SQLite")
-                verify_schema_upgrade(folder, log, processes)
-                verify_schema_upgrade(folder, log, processes, with_operation_id=True)
+                        raise AssertionError("Falta la restricción de severidad en PostgreSQL")
                 print("OK: web/móvil, validación, 201/200/409, concurrencia, gateway, CORS, índice único, reinicio y migraciones sin pérdida de datos ni UUID.")
             except Exception:
                 log.flush()

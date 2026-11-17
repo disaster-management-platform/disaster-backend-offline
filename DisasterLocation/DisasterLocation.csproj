@@ -9,7 +9,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14" />
     <ProjectReference Include="../DisasterLocation.BLL/DisasterLocation.BLL.csproj" />
-    <PackageReference Include="DisasterPlatform.DAL" Version="1.0.0" />
+    <PackageReference Include="DisasterPlatform.DAL" Version="2.0.0" />
   </ItemGroup>
 
   <ItemGroup>

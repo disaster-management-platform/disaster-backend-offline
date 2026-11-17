@@ -1,19 +1,23 @@
 using DisasterLocation.BLL;
 using DisasterLocation.Core;
 using DisasterLocation.DAL;
+using Platform.DAL;
 
 var builder = WebApplication.CreateBuilder(args);
+var connectionString = builder.Configuration.GetConnectionString("Disasters")
+    ?? throw new InvalidOperationException("Configure ConnectionStrings:Disasters para PostgreSQL.");
+if (builder.Configuration.GetValue<bool>("Database:Migrate"))
+{
+    await PlatformDatabase.MigrateAsync(connectionString);
+    return;
+}
 builder.Services.AddOpenApi();
 builder.Services.AddProblemDetails();
 builder.Services.AddScoped<DisasterService>();
-builder.Services.AddDataAccess(
-    builder.Configuration.GetConnectionString("Disasters") ?? "Data Source=App_Data/disasters.db",
-    builder.Environment.ContentRootPath);
+builder.Services.AddDataAccess(connectionString);
 
 var app = builder.Build();
 app.UseExceptionHandler();
-// El DAL aplica las migraciones pendientes antes de recibir solicitudes.
-await app.Services.InitializeDataAccessAsync();
 if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 
