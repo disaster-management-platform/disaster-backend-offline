@@ -4,7 +4,7 @@ Proyecto de taller en .NET 10: registra nombre, ubicación, severidad (1–5), d
 
 ## Ejecutar
 
-Requisito: SDK de .NET 10. No necesitas instalar un servidor de base de datos ni herramientas de frontend.
+Requisitos: SDK de .NET 10, acceso a GitHub Packages para restaurar las bibliotecas privadas y una conexión PostgreSQL propia de esta API. La conexión se proporciona mediante `ConnectionStrings__Disasters`, fuera de los archivos versionados. Las conexiones TCP requieren `SSL Mode=VerifyFull` y una CA confiable.
 
 Desde la raíz de la solución:
 
@@ -13,21 +13,25 @@ dotnet restore
 dotnet build
 ```
 
-Terminal 1 — API:
+Antes del primer arranque, aplica las migraciones con el comando administrativo descrito en la sección de persistencia.
+
+Terminal 1 — API, con la ruta del archivo local protegido en `DISASTERS_CONNECTION_FILE`:
 
 ```bash
-dotnet run --project DisasterLocation --launch-profile http
+ConnectionStrings__Disasters="$(cat "$DISASTERS_CONNECTION_FILE")" \
+  dotnet run --project DisasterLocation --no-launch-profile --urls http://localhost:5156
 ```
 
 Terminal 2 — gateway e interfaz, desde esta misma raíz y con el repositorio independiente `disaster-api-gateway` situado junto a este repositorio:
 
 ```bash
-dotnet run --project ../disaster-api-gateway/DisasterLocation.Gateway --launch-profile http
+ReverseProxy__Clusters__disasters-api__Destinations__local__Address=http://localhost:5156/ \
+  dotnet run --project ../disaster-api-gateway/DisasterLocation.Gateway --launch-profile http
 ```
 
 Abre **http://localhost:5080**. Escribe los datos, selecciona un punto en el mapa (o escribe latitud y longitud) y registra el desastre. Se agrega a la lista y al mapa. Los puntos usan colores según la severidad. El nombre de la ubicación es descriptivo: no se convierte automáticamente una dirección en coordenadas.
 
-También puedes iniciar ambos procesos desde **Ejecutar y depurar → API + Gateway** en VS Code. Si ya tenías la plantilla ejecutándose en el puerto 5156, detén esa sesión y vuelve a iniciarla para cargar el nuevo código.
+En las configuraciones de lanzamiento, proporciona la conexión únicamente al proceso API. El Gateway solo necesita la dirección HTTP del destino.
 
 ## Separación de arquitectura
 
@@ -39,14 +43,14 @@ flowchart LR
     A --> B[BLL · reglas de negocio]
     B --> R[IDisasterRepository]
     R --> D[DAL · repositorio + DbContext]
-    D --> S[(SQLite)]
+    D --> S[(PostgreSQL)]
 ```
 
 | Proyecto | Responsabilidad | Archivo principal |
 | --- | --- | --- |
 | `DisasterLocation.Core` | DTOs HTTP propios; entidades e interfaces mediante `DisasterPlatform.Core`. | [Contracts.cs](DisasterLocation.Core/Contracts.cs) |
 | `DisasterLocation.BLL` | Valida y normaliza los datos. Usa la abstracción del repositorio. | [DisasterService.cs](DisasterLocation.BLL/DisasterService.cs) |
-| `DisasterPlatform.DAL` (NuGet) | Configura SQLite, mapea la tabla, consulta y guarda usando EF Core. | [Repositorio compartido](https://github.com/disaster-management-platform/disaster-platform-dal) |
+| `DisasterPlatform.DAL` (NuGet) | Configura PostgreSQL, mapea la tabla, consulta y guarda usando EF Core. | [Repositorio compartido](https://github.com/disaster-management-platform/disaster-platform-dal) |
 | `DisasterLocation` | Recibe HTTP, llama a la BLL y devuelve códigos HTTP y JSON. Conecta las implementaciones mediante inyección de dependencias. | [Program.cs](DisasterLocation/Program.cs) |
 | `DisasterLocation.Gateway` (repositorio independiente) | Reenvía `/api/*` a la API con YARP y sirve los archivos de presentación. | [Program.cs](../disaster-api-gateway/DisasterLocation.Gateway/Program.cs), [appsettings.json](../disaster-api-gateway/DisasterLocation.Gateway/appsettings.json) |
 
@@ -60,13 +64,20 @@ La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus
 4. Si no existe, el repositorio guarda con EF Core. Un índice único sobre `ClientRequestId` evita duplicados incluso si llegan dos solicitudes al mismo tiempo. Si otra solicitud guardó primero, se recupera su registro y la BLL también compara el contenido.
 5. La API responde `201 Created` al crear, `200 OK` al recuperar o `409 Conflict` si se reutilizó la clave con otros datos. El gateway conserva estas respuestas.
 
-Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y SQLite está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
+Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y PostgreSQL está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
 
-La base se crea automáticamente en `DisasterLocation/App_Data/disasters.db`. Los registros sobreviven a reinicios. La conexión se configura en `DisasterLocation/appsettings.json`, sección `ConnectionStrings:Disasters`; una ruta relativa se resuelve desde el directorio de la API.
+La persistencia se distribuye mediante `DisasterPlatform.DAL 2.0.1`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. Esta API conserva su contrato HTTP original.
 
-La API aplica las migraciones de EF Core al iniciar, mediante `MigrateAsync`. Están en `DisasterPlatform.DAL/Migrations/Disasters` del repositorio compartido y conservan el esquema original, la incorporación de `OperationId` y su cambio de nombre a `ClientRequestId`, con índice único. La migración de ciclo de vida incorpora `Radio`, `Phase`, `Version` y auditoría sin ampliar el contrato HTTP de esta API. El cambio de nombre conserva los UUID que ya estaban guardados.
+Las migraciones se ejecutan explícitamente con una conexión administrativa separada. Con su archivo protegido indicado en `MIGRATION_CONNECTION_FILE`:
 
-Si la base se creó con `EnsureCreated`, `LegacySchemaBaseline` reconoce el esquema anterior y registra las migraciones que ya representa antes de aplicar las pendientes. No hay que borrar la base: los reportes conservan sus IDs y las claves existentes. Los reportes históricos que nunca tuvieron una clave quedan con `ClientRequestId` en `NULL`. Los siguientes arranques usan el historial de EF para aplicar solo lo que falta.
+```bash
+ConnectionStrings__Disasters="$(cat "$MIGRATION_CONNECTION_FILE")" \
+  dotnet run --project DisasterLocation --no-launch-profile -- --Database:Migrate=true
+```
+
+Este comando aplica las cadenas PostgreSQL de ambos contextos del DAL y termina sin abrir el servidor HTTP. El arranque normal no aplica migraciones ni crea archivos locales. No se reutilizan historiales de SQLite.
+
+En Supabase, las credenciales actuales de las dos APIs de desastres son de solo lectura; la activación de un propietario de escritura sigue pendiente. Utiliza PostgreSQL local aislado para las pruebas de escritura.
 
 Para agregar otro cambio de esquema, desde el repositorio `disaster-platform-dal`:
 
@@ -75,7 +86,7 @@ dotnet tool restore
 dotnet ef migrations add NombreDelCambio --project DisasterPlatform.DAL --context DisasterDbContext
 ```
 
-La herramienta `dotnet-ef` está fijada a la misma versión que EF Core en `dotnet-tools.json`. La fábrica de diseño utiliza `ConnectionStrings__Disasters` y permite generar las migraciones sin iniciar la API. Al ejecutar la API se aplican sobre la conexión configurada en `appsettings.json`.
+La herramienta `dotnet-ef` está fijada a la misma versión que EF Core en `dotnet-tools.json`. La fábrica de diseño utiliza `ConnectionStrings__Disasters` y permite generar las migraciones sin iniciar la API. Los cambios se aplican con el comando explícito de migración y credenciales administrativas; la API utiliza sus propias credenciales de ejecución.
 
 ## Contrato compartido por web y móvil
 
@@ -98,7 +109,7 @@ Solicitud de registro, con la cabecera `Idempotency-Key: 550e8400-e29b-41d4-a716
 }
 ```
 
-La respuesta tiene los mismos campos y un `id` entero generado por SQLite. Todos los campos de registro son obligatorios. Límites: nombre 120 caracteres, ubicación 200, descripción 2000; severidad entera de 1 a 5; latitud de −90 a 90; longitud de −180 a 180. Los errores de negocio incluyen un objeto `errors` con mensajes por campo en formato Problem Details.
+La respuesta tiene los mismos campos y un `id` entero generado por PostgreSQL. Todos los campos de registro son obligatorios. Límites: nombre 120 caracteres, ubicación 200, descripción 2000; severidad entera de 1 a 5; latitud de −90 a 90; longitud de −180 a 180. Los errores de negocio incluyen un objeto `errors` con mensajes por campo en formato Problem Details.
 
 Hay solicitudes listas para ejecutar en [DisasterLocation.http](DisasterLocation/DisasterLocation.http). El documento OpenAPI está en http://localhost:5156/openapi/v1.json cuando la API corre en desarrollo.
 
@@ -149,23 +160,27 @@ La primera vez devuelve `201`. Repite el comando: devuelve `200` con el mismo ID
 El gateway no necesita saber si la solicitud viene de una web o de una app móvil. Para ver la web en un celular conectado a la misma red, inicia el gateway con:
 
 ```bash
-dotnet run --project ../disaster-api-gateway/DisasterLocation.Gateway --launch-profile http --urls http://0.0.0.0:5080
+ReverseProxy__Clusters__disasters-api__Destinations__local__Address=http://localhost:5156/ \
+  dotnet run --project ../disaster-api-gateway/DisasterLocation.Gateway --launch-profile http --urls http://0.0.0.0:5080
 ```
 
 En el celular abre `http://IP_DEL_COMPUTADOR:5080`. `localhost` en el teléfono apunta al propio teléfono. La API puede seguir escuchando solo en localhost, ya que el gateway corre en el computador. La red y el firewall deben permitir el puerto 5080. Una app nativa puede requerir habilitar HTTP local en su configuración de desarrollo; para despliegue usa HTTPS.
 
 Para una web alojada en otro origen, agrega su dirección exacta a `Cors:AllowedOrigins` en la configuración del gateway. La interfaz incluida usa el mismo origen y no necesita esta configuración. Si cambias el puerto de la API, actualiza `ReverseProxy:Clusters:disasters-api:Destinations:local:Address` en el gateway.
 
-La biblioteca Leaflet está incluida localmente en `wwwroot/lib/leaflet` con su licencia. El mapa base de OpenStreetMap requiere internet. El formulario y la lista siguen disponibles si las imágenes del mapa no cargan.
+La biblioteca Leaflet está incluida localmente en `wwwroot/lib/leaflet` del repositorio `disaster-api-gateway`, con su licencia. El mapa base de OpenStreetMap requiere internet. El formulario y la lista siguen disponibles si las imágenes del mapa no cargan.
 
 ## Verificación
 
+Las pruebas requieren `psycopg2` y un PostgreSQL local accesible por socket Unix, cuyo usuario pueda crear bases temporales. Configura `PGSOCKET` con el directorio de ese socket:
+
 ```bash
+export TEST_POSTGRES_DSN="host=${PGSOCKET:?Configura el socket PostgreSQL local} port=5432 dbname=postgres user=$(id -un)"
 dotnet build
 dotnet build ../disaster-api-gateway/DisasterLocation.Gateway.sln
 python3 scripts/smoke_test.py
 ```
 
-La prueba inicia API y gateway en puertos temporales y usa bases temporales. Comprueba el registro web y móvil, validación, reintentos `201/200`, conflictos `409`, solicitudes concurrentes, CORS y el índice único. También comprueba que un reintento conserva su ID tras reiniciar la API y que las bases anteriores, con y sin `OperationId`, se migran sin perder registros ni UUID. Al terminar detiene los procesos y elimina sus datos de prueba.
+La prueba inicia API y gateway en puertos temporales y usa bases temporales. Comprueba el registro web y móvil, validación, reintentos `201/200`, conflictos `409`, solicitudes concurrentes, CORS y el índice único. También comprueba que un reintento conserva su ID tras reiniciar la API y que dos instancias comparten la misma operación idempotente. Las migraciones se aplican antes de iniciar las APIs de prueba. Al terminar detiene los procesos y elimina sus datos de prueba.
 
-Referencias: [YARP](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/getting-started?view=aspnetcore-10.0), [EF Core con SQLite](https://learn.microsoft.com/en-us/training/modules/build-web-api-minimal-database/), [Leaflet 1.9](https://leafletjs.com/examples-v1/quick-start/).
+Referencias: [YARP](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/getting-started?view=aspnetcore-10.0), [Npgsql con EF Core](https://www.npgsql.org/efcore/), [Leaflet 1.9](https://leafletjs.com/examples-v1/quick-start/).
