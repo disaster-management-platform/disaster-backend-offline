@@ -9,8 +9,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DisasterLocation.Core", "Di
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DisasterLocation.BLL", "DisasterLocation.BLL\DisasterLocation.BLL.csproj", "{31E27CC9-2BA5-4C3B-A8D0-2A7C59CD87FE}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DisasterLocation.DAL", "DisasterLocation.DAL\DisasterLocation.DAL.csproj", "{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -57,18 +55,6 @@ Global
 		{31E27CC9-2BA5-4C3B-A8D0-2A7C59CD87FE}.Release|x64.Build.0 = Release|Any CPU
 		{31E27CC9-2BA5-4C3B-A8D0-2A7C59CD87FE}.Release|x86.ActiveCfg = Release|Any CPU
 		{31E27CC9-2BA5-4C3B-A8D0-2A7C59CD87FE}.Release|x86.Build.0 = Release|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Debug|x64.ActiveCfg = Debug|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Debug|x64.Build.0 = Debug|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Debug|x86.ActiveCfg = Debug|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Debug|x86.Build.0 = Debug|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Release|Any CPU.Build.0 = Release|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Release|x64.ActiveCfg = Release|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Release|x64.Build.0 = Release|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Release|x86.ActiveCfg = Release|Any CPU
-		{70D3E725-4C99-4AC3-B39F-94BE9E1FB1A3}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -44,9 +44,9 @@ flowchart LR
 
 | Proyecto | Responsabilidad | Archivo principal |
 | --- | --- | --- |
-| `DisasterLocation.Core` | Modelo, DTOs e interfaz del repositorio. Sin dependencias de infraestructura. | [IDisasterRepository.cs](DisasterLocation.Core/IDisasterRepository.cs), [Contracts.cs](DisasterLocation.Core/Contracts.cs) |
+| `DisasterLocation.Core` | DTOs HTTP propios; entidades e interfaces mediante `DisasterPlatform.Core`. | [Contracts.cs](DisasterLocation.Core/Contracts.cs) |
 | `DisasterLocation.BLL` | Valida y normaliza los datos. Usa la abstracción del repositorio. | [DisasterService.cs](DisasterLocation.BLL/DisasterService.cs) |
-| `DisasterLocation.DAL` | Configura SQLite, mapea la tabla, consulta y guarda usando EF Core. | [DisasterRepository.cs](DisasterLocation.DAL/DisasterRepository.cs), [DisasterDbContext.cs](DisasterLocation.DAL/DisasterDbContext.cs) |
+| `DisasterPlatform.DAL` (NuGet) | Configura SQLite, mapea la tabla, consulta y guarda usando EF Core. | [Repositorio compartido](https://github.com/disaster-management-platform/disaster-platform-dal) |
 | `DisasterLocation` | Recibe HTTP, llama a la BLL y devuelve códigos HTTP y JSON. Conecta las implementaciones mediante inyección de dependencias. | [Program.cs](DisasterLocation/Program.cs) |
 | `DisasterLocation.Gateway` (repositorio independiente) | Reenvía `/api/*` a la API con YARP y sirve los archivos de presentación. | [Program.cs](../disaster-api-gateway/DisasterLocation.Gateway/Program.cs), [appsettings.json](../disaster-api-gateway/DisasterLocation.Gateway/appsettings.json) |
 
@@ -64,18 +64,18 @@ Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El
 
 La base se crea automáticamente en `DisasterLocation/App_Data/disasters.db`. Los registros sobreviven a reinicios. La conexión se configura en `DisasterLocation/appsettings.json`, sección `ConnectionStrings:Disasters`; una ruta relativa se resuelve desde el directorio de la API.
 
-La API aplica las migraciones de EF Core al iniciar, mediante `MigrateAsync`. Están en `DisasterLocation.DAL/Migrations` y cubren el esquema original, la incorporación de `OperationId` de la versión anterior y su cambio de nombre a `ClientRequestId`, con índice único. El cambio de nombre conserva los UUID que ya estaban guardados.
+La API aplica las migraciones de EF Core al iniciar, mediante `MigrateAsync`. Están en `DisasterPlatform.DAL/Migrations/Disasters` del repositorio compartido y conservan el esquema original, la incorporación de `OperationId` y su cambio de nombre a `ClientRequestId`, con índice único. La migración de ciclo de vida incorpora `Radio`, `Phase`, `Version` y auditoría sin ampliar el contrato HTTP de esta API. El cambio de nombre conserva los UUID que ya estaban guardados.
 
 Si la base se creó con `EnsureCreated`, `LegacySchemaBaseline` reconoce el esquema anterior y registra las migraciones que ya representa antes de aplicar las pendientes. No hay que borrar la base: los reportes conservan sus IDs y las claves existentes. Los reportes históricos que nunca tuvieron una clave quedan con `ClientRequestId` en `NULL`. Los siguientes arranques usan el historial de EF para aplicar solo lo que falta.
 
-Para agregar otro cambio de esquema:
+Para agregar otro cambio de esquema, desde el repositorio `disaster-platform-dal`:
 
 ```bash
 dotnet tool restore
-dotnet ef migrations add NombreDelCambio --project DisasterLocation.DAL
+dotnet ef migrations add NombreDelCambio --project DisasterPlatform.DAL --context DisasterDbContext
 ```
 
-La herramienta `dotnet-ef` está fijada a la misma versión que EF Core en `dotnet-tools.json`. La fábrica de diseño permite generar las migraciones sin iniciar la API. Al ejecutar la API se aplican sobre la conexión configurada en `appsettings.json`.
+La herramienta `dotnet-ef` está fijada a la misma versión que EF Core en `dotnet-tools.json`. La fábrica de diseño utiliza `ConnectionStrings__Disasters` y permite generar las migraciones sin iniciar la API. Al ejecutar la API se aplican sobre la conexión configurada en `appsettings.json`.
 
 ## Contrato compartido por web y móvil
 

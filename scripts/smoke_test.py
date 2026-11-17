@@ -193,7 +193,10 @@ def verify_schema_upgrade(folder, log, processes, with_operation_id=False):
         assert connection.execute("SELECT COUNT(*) FROM Desastres WHERE ClientRequestId IS NULL").fetchone()[0] == expected_nulls
         columns = {row[1] for row in connection.execute("PRAGMA table_info('Desastres')")}
         assert "ClientRequestId" in columns and "OperationId" not in columns
-        assert connection.execute('SELECT COUNT(*) FROM "__EFMigrationsHistory"').fetchone()[0] == 3
+        assert {"Radio", "Phase", "Version"}.issubset(columns)
+        assert connection.execute("SELECT COUNT(*) FROM Desastres WHERE Phase != 0 OR Version != 1 OR Radio IS NOT NULL").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM DisasterPhaseAudit").fetchone()[0] == 0
+        assert connection.execute('SELECT COUNT(*) FROM "__EFMigrationsHistory"').fetchone()[0] == 4
         assert any(row[1] == "IX_Desastres_ClientRequestId" and row[2] == 1
                    for row in connection.execute("PRAGMA index_list('Desastres')"))
 
@@ -287,7 +290,7 @@ def main():
                 assert status == 200 and replay == idempotent, "El reintento tras reiniciar debe recuperar el mismo ID"
                 with sqlite3.connect(database) as connection:
                     assert connection.execute("SELECT COUNT(*) FROM Desastres").fetchone()[0] == 6
-                    assert connection.execute('SELECT COUNT(*) FROM "__EFMigrationsHistory"').fetchone()[0] == 3
+                    assert connection.execute('SELECT COUNT(*) FROM "__EFMigrationsHistory"').fetchone()[0] == 4
                     try:
                         connection.execute("UPDATE Desastres SET ClientRequestId = ?", (operation["Idempotency-Key"].upper(),))
                     except sqlite3.IntegrityError:
