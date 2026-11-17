@@ -19,10 +19,10 @@ Terminal 1 — API:
 dotnet run --project DisasterLocation --launch-profile http
 ```
 
-Terminal 2 — gateway e interfaz:
+Terminal 2 — gateway e interfaz, desde esta misma raíz y con el repositorio independiente `disaster-api-gateway` situado junto a este repositorio:
 
 ```bash
-dotnet run --project DisasterLocation.Gateway --launch-profile http
+dotnet run --project ../disaster-api-gateway/DisasterLocation.Gateway --launch-profile http
 ```
 
 Abre **http://localhost:5080**. Escribe los datos, selecciona un punto en el mapa (o escribe latitud y longitud) y registra el desastre. Se agrega a la lista y al mapa. Los puntos usan colores según la severidad. El nombre de la ubicación es descriptivo: no se convierte automáticamente una dirección en coordenadas.
@@ -48,7 +48,7 @@ flowchart LR
 | `DisasterLocation.BLL` | Valida y normaliza los datos. Usa la abstracción del repositorio. | [DisasterService.cs](DisasterLocation.BLL/DisasterService.cs) |
 | `DisasterLocation.DAL` | Configura SQLite, mapea la tabla, consulta y guarda usando EF Core. | [DisasterRepository.cs](DisasterLocation.DAL/DisasterRepository.cs), [DisasterDbContext.cs](DisasterLocation.DAL/DisasterDbContext.cs) |
 | `DisasterLocation` | Recibe HTTP, llama a la BLL y devuelve códigos HTTP y JSON. Conecta las implementaciones mediante inyección de dependencias. | [Program.cs](DisasterLocation/Program.cs) |
-| `DisasterLocation.Gateway` | Reenvía `/api/*` a la API con YARP y sirve los archivos de presentación. | [Program.cs](DisasterLocation.Gateway/Program.cs), [appsettings.json](DisasterLocation.Gateway/appsettings.json) |
+| `DisasterLocation.Gateway` (repositorio independiente) | Reenvía `/api/*` a la API con YARP y sirve los archivos de presentación. | [Program.cs](../disaster-api-gateway/DisasterLocation.Gateway/Program.cs), [appsettings.json](../disaster-api-gateway/DisasterLocation.Gateway/appsettings.json) |
 
 La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus servicios. El gateway no tiene referencias a estos proyectos: no valida desastres ni accede a la base de datos.
 
@@ -149,7 +149,7 @@ La primera vez devuelve `201`. Repite el comando: devuelve `200` con el mismo ID
 El gateway no necesita saber si la solicitud viene de una web o de una app móvil. Para ver la web en un celular conectado a la misma red, inicia el gateway con:
 
 ```bash
-dotnet run --project DisasterLocation.Gateway --launch-profile http --urls http://0.0.0.0:5080
+dotnet run --project ../disaster-api-gateway/DisasterLocation.Gateway --launch-profile http --urls http://0.0.0.0:5080
 ```
 
 En el celular abre `http://IP_DEL_COMPUTADOR:5080`. `localhost` en el teléfono apunta al propio teléfono. La API puede seguir escuchando solo en localhost, ya que el gateway corre en el computador. La red y el firewall deben permitir el puerto 5080. Una app nativa puede requerir habilitar HTTP local en su configuración de desarrollo; para despliegue usa HTTPS.
@@ -162,6 +162,7 @@ La biblioteca Leaflet está incluida localmente en `wwwroot/lib/leaflet` con su 
 
 ```bash
 dotnet build
+dotnet build ../disaster-api-gateway/DisasterLocation.Gateway.sln
 python3 scripts/smoke_test.py
 ```
 
