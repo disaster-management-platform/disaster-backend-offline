@@ -1,6 +1,8 @@
 """Prueba real Gateway -> API -> BLL -> DAL -> SQLite, con base temporal.
 
-Ejecutar desde la raíz: dotnet build && python3 scripts/smoke_test.py
+Ejecutar desde la raíz:
+dotnet build && dotnet build ../disaster-api-gateway/DisasterLocation.Gateway.sln
+python3 scripts/smoke_test.py
 No modifica los datos de la aplicación ni usa sus puertos de desarrollo.
 """
 import json
@@ -57,10 +59,11 @@ def wait_ready(base, path, process):
 
 
 def start(project, port, env, log):
-    dll = ROOT / project / "bin/Debug/net10.0" / f"{project}.dll"
+    root = ROOT.parent / "disaster-api-gateway" if project == "DisasterLocation.Gateway" else ROOT
+    dll = root / project / "bin/Debug/net10.0" / f"{project}.dll"
     return subprocess.Popen(
         ["dotnet", str(dll), "--urls", f"http://127.0.0.1:{port}"],
-        cwd=ROOT / project, env={**os.environ, **env}, stdout=log, stderr=log)
+        cwd=root / project, env={**os.environ, **env}, stdout=log, stderr=log)
 
 
 def stop(process):
