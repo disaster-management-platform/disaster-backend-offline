@@ -118,7 +118,7 @@ def verify_idempotency(base, payload):
     operation = {"Idempotency-Key": key, "User-Agent": "okhttp/Android"}
     status, headers, saved = request(base, method="POST", data=payload, headers=operation)
     assert status == 201 and headers["Location"] == f'/api/desastres/{saved["id"]}'
-    assert set(saved) == set(payload) | {"id", "radio", "phase", "version"}
+    assert set(saved) == set(payload) | {"id", "radio", "phase", "version", "disasterTypeId", "startedAt", "registeredAt", "updatedAt", "attentionLevel"}
     assert saved["radio"] is None and saved["phase"] == "Registered" and saved["version"] == 1
     for retry_key in [key, key.upper()]:
         status, _, replay = request(base, method="POST", data=payload,
@@ -278,7 +278,7 @@ def main():
                     cursor.execute('SELECT COUNT(*) FROM "Desastres"')
                     assert cursor.fetchone()[0] == 7
                     cursor.execute('SELECT COUNT(*) FROM disasters."__EFMigrationsHistory_Disaster"')
-                    assert cursor.fetchone()[0] == 2
+                    assert cursor.fetchone()[0] == 3
                     try:
                         cursor.execute('UPDATE "Desastres" SET "ClientRequestId" = %s', (operation["Idempotency-Key"].upper(),))
                     except psycopg2.IntegrityError:

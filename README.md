@@ -66,7 +66,7 @@ La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus
 
 Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y PostgreSQL está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
 
-La persistencia se distribuye mediante `DisasterPlatform.DAL 2.0.1`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. La API conserva los campos originales y añade `radio` nullable, `phase` y `version` a las respuestas. `radio` es opcional en la creación y, cuando se informa, debe ser mayor que cero y no superar 1.000.000 metros.
+La persistencia se distribuye mediante `DisasterPlatform.Core 2.0.0` y `DisasterPlatform.DAL 3.0.0`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. La API conserva los campos originales y añade `radio` nullable, `phase` y `version` a las respuestas. `radio` es opcional en la creación y, cuando se informa, debe ser mayor que cero y no superar 1.000.000 metros.
 
 Las migraciones se ejecutan explícitamente con una conexión administrativa separada. Con su archivo protegido indicado en `MIGRATION_CONNECTION_FILE`:
 
@@ -88,7 +88,21 @@ dotnet ef migrations add NombreDelCambio --project DisasterPlatform.DAL --contex
 
 La herramienta `dotnet-ef` está fijada a la misma versión que EF Core en `dotnet-tools.json`. La fábrica de diseño utiliza `ConnectionStrings__Disasters` y permite generar las migraciones sin iniciar la API. Los cambios se aplican con el comando explícito de migración y credenciales administrativas; la API utiliza sus propias credenciales de ejecución.
 
-La seguridad común se consume mediante `DisasterPlatform.Security 1.0.0`. GET y POST conservan el acceso utilizado por los clientes existentes. `PUT /api/desastres/{id}/fase` recibe `phase` y `expectedVersion`, requiere JWT con `sub`, `organization_id`, rol `reconstruction.write` y acceso mediante `disaster_id`. Se conservan Registered → Response → Recovery → Closed, concurrencia optimista y auditoría transaccional. `Security__Authority` y `Security__Audience` configuran el proveedor existente; `Security__LocalDemo=true` solo se admite explícitamente en Development.
+La seguridad común se consume mediante `DisasterPlatform.Security 1.0.0`. El registro y la consulta mantienen el acceso de los clientes anteriores; deben integrarse con identidad antes de exponer la plataforma públicamente. `PUT /api/desastres/{id}` y `/fase` requieren JWT con `sub`, `organization_id`, rol `reconstruction.write` y acceso mediante `disaster_id`. El historial requiere `reconstruction.read`. El catálogo permite lectura pública; su creación y desactivación requieren el rol `disasters.admin`. `Security__Authority` y `Security__Audience` configuran el proveedor existente; `Security__LocalDemo=true` solo se admite explícitamente en Development.
+
+Las transiciones autorizadas son:
+
+| Fase actual | Fases siguientes |
+| --- | --- |
+| Detected | Registered |
+| Registered | Assessment, Response, Recovery, Closed |
+| Assessment | Response, Recovery, Closed |
+| Response | Recovery, Closed |
+| Recovery | Reconstruction, Closed |
+| Reconstruction | Closed |
+| Closed | Ninguna |
+
+`Registered=0`, `Response=1`, `Recovery=2` y `Closed=3` conservan sus valores; `Detected=4`, `Assessment=5` y `Reconstruction=6`. La creación conserva Registered. Cada cambio recibe `expectedVersion`; los saltos y cierres requieren `reason`. Cerrar requiere además `confirmNoCriticalCommitments=true`, confirmado por el responsable autorizado. La comprobación automática entre dominios está pendiente. La actualización, el incremento de versión y su auditoría se guardan en una transacción.
 
 ## Contrato compartido por web y móvil
 
@@ -97,6 +111,11 @@ La seguridad común se consume mediante `DisasterPlatform.Security 1.0.0`. GET y
 | GET | `/api/desastres` | `200`, arreglo de desastres (vacío si no hay registros). |
 | GET | `/api/desastres/{id}` | `200`, un desastre; `404` si no existe. |
 | POST | `/api/desastres` | `201` al crear, `200` al repetir la operación, `409` si cambia su contenido; `400` si los datos o la clave son inválidos. |
+| PUT | `/api/desastres/{id}` | Actualiza los campos autorizados con `expectedVersion`; `409` ante una versión obsoleta. |
+| PUT | `/api/desastres/{id}/fase` | Cambia la fase con control de versión y auditoría. |
+| GET | `/api/desastres/{id}/historial` | Historial autorizado con responsable, fecha, cambios, resultado y justificación. |
+| GET / POST | `/api/tipos-desastre` | Consulta pública / alta administrativa. |
+| PUT | `/api/tipos-desastre/{id}/desactivar` | Desactivación administrativa sin borrar referencias históricas. |
 
 Solicitud de registro, con la cabecera `Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000`:
 
@@ -111,7 +130,7 @@ Solicitud de registro, con la cabecera `Idempotency-Key: 550e8400-e29b-41d4-a716
 }
 ```
 
-La respuesta incluye los campos originales, un `id` entero generado por PostgreSQL, `radio` nullable, `phase` y `version`. Todos los campos de registro son obligatorios. Límites: nombre 120 caracteres, ubicación 200, descripción 2000; severidad entera de 1 a 5; latitud de −90 a 90; longitud de −180 a 180. Los errores de negocio incluyen un objeto `errors` con mensajes por campo en formato Problem Details.
+La respuesta incluye los campos originales, un `id` entero generado por PostgreSQL, `radio` nullable, `phase` y `version`. Los seis atributos originales del ejemplo son obligatorios. `radio`, `disasterTypeId`, `startedAt` y `attentionLevel` son opcionales; su omisión representa información desconocida. El catálogo inicial incluye terremoto, inundación, incendio, deslizamiento, huracán y erupción volcánica. La clasificación de atención es independiente de severidad: 1 Bajo, 2 Medio, 3 Alto y 4 Crítico. `startedAt` acepta una fecha con zona horaria y se normaliza a UTC. `registeredAt` y `updatedAt` son generados por el servidor; los históricos sin fecha comprobable conservan null. Límites: nombre 120 caracteres, ubicación 200, descripción 2000; severidad entera de 1 a 5; latitud de −90 a 90; longitud de −180 a 180. Los errores de negocio incluyen un objeto `errors` con mensajes por campo en formato Problem Details.
 
 Hay solicitudes listas para ejecutar en [DisasterLocation.http](DisasterLocation/DisasterLocation.http). El documento OpenAPI está en http://localhost:5156/openapi/v1.json cuando la API corre en desarrollo.
 
@@ -143,7 +162,9 @@ Un `400` requiere corregir los datos. Un `409` indica que la clave ya pertenece 
 
 Con Retrofit, `@POST("desastres")` funciona si el `baseUrl` termina en `/api/`, por ejemplo `http://IP_DEL_COMPUTADOR:5080/api/`. El JSON de respuesta sigue teniendo los mismos campos, incluido el `id` entero, por lo que sirve para `DisasterInfoDto`.
 
-La cabecera acepta un UUID con guiones, distinto de cero, sin distinguir mayúsculas. Si se envía vacía o con un formato inválido, se responde `400`. Para conservar la compatibilidad con la web actual, las solicitudes sin cabecera siguen creando registros, pero sus reenvíos no se deduplican. La comparación contempla los seis campos originales y `radio`, después de quitar los espacios al inicio y al final de los textos. Omitir `radio` equivale a enviarlo como `null`. Reutilizar la misma clave con un radio diferente, incluido cambiar entre `null` y un valor, devuelve `409` y no modifica el registro anterior.
+La cabecera acepta un UUID con guiones, distinto de cero, sin distinguir mayúsculas. Si se envía vacía o con un formato inválido, se responde `400`. Para conservar la compatibilidad con la web actual, las solicitudes sin cabecera siguen creando registros, pero sus reenvíos no se deduplican. La comparación contempla los seis campos originales, `radio`, `disasterTypeId`, `startedAt` y `attentionLevel`, después de quitar los espacios al inicio y al final de los textos. Omitir `radio` equivale a enviarlo como `null`. Reutilizar la misma clave con un radio diferente, incluido cambiar entre `null` y un valor, devuelve `409` y no modifica el registro anterior.
+
+El contenido original de creación se conserva de forma atómica e inmutable. Un POST repetido confirma ese contenido y su versión inicial, incluso si un PUT modificó después el desastre. GET devuelve el estado vigente; el cliente no debe reemplazarlo con un recibo histórico. Las operaciones anteriores conservan sus campos omitidos como null. Si el contenido histórico no puede reconstruirse con certeza, la repetición devuelve 409 y requiere revisión.
 
 Puedes comprobarlo con:
 

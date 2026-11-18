@@ -20,6 +20,10 @@ builder.Services.AddProblemDetails();
 builder.Services.AddScoped<DisasterService>();
 builder.Services.AddDataAccess(connectionString);
 builder.Services.AddPlatformSecurity(builder.Configuration, builder.Environment);
+var localDemo = builder.Environment.IsDevelopment() && builder.Configuration.GetValue<bool>("Security:LocalDemo");
+builder.Services.AddAuthorization(options => options.AddPolicy("DisasterAdministration", policy =>
+    policy.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id").RequireAssertion(context => context.User.IsInRole("disasters.admin")
+        || (localDemo && context.User.HasClaim("local_demo", "true")))));
 
 var app = builder.Build();
 app.UseAuthentication();
@@ -88,5 +92,41 @@ disasters.MapPut("/{id:int}/fase", async (int id, ChangeDisasterPhaseRequest req
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException) { return Results.Conflict(new { detail = "El desastre cambió; actualice su versión." }); }
 }).RequireAuthorization(PlatformSecurity.Write);
+disasters.MapPut("/{id:int}", async (int id, UpdateDisasterRequest request, HttpContext http,
+    DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+{
+    if (!access.CanAccess(id)) return Results.Forbid();
+    try
+    {
+        var result = await service.UpdateAsync(id, request, PlatformSecurity.Actor(http.User), ct);
+        return result is null ? Results.NotFound() : Results.Ok(result);
+    }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+    catch (DisasterConflictException) { return Results.Conflict(new { detail = "El desastre cambió; actualice su versión." }); }
+}).RequireAuthorization(PlatformSecurity.Write);
+
+disasters.MapGet("/{id:int}/historial", async (int id, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+{
+    if (!access.CanAccess(id)) return Results.Forbid();
+    if (await service.GetByIdAsync(id, ct) is null) return Results.NotFound();
+    return Results.Ok(await service.GetHistoryAsync(id, ct));
+}).RequireAuthorization(PlatformSecurity.Read);
+
+var types = app.MapGroup("/api/tipos-desastre").WithTags("Tipos de desastre");
+types.MapGet("/", async (DisasterService service, CancellationToken ct) => Results.Ok(await service.GetTypesAsync(ct)))
+    .AllowAnonymous();
+types.MapPost("/", async (CreateDisasterTypeRequest request, DisasterService service, CancellationToken ct) =>
+{
+    try
+    {
+        var type = await service.AddTypeAsync(request, ct);
+        return type is null ? Results.Conflict(new { detail = "Ya existe un tipo con ese nombre." })
+            : Results.Created($"/api/tipos-desastre/{type.Id}", type);
+    }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+}).RequireAuthorization("DisasterAdministration");
+types.MapPut("/{id:int}/desactivar", async (int id, DisasterService service, CancellationToken ct) =>
+    await service.DeactivateTypeAsync(id, ct) ? Results.NoContent() : Results.NotFound())
+    .RequireAuthorization("DisasterAdministration");
 app.Run();
 public partial class Program { }
