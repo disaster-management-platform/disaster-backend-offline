@@ -293,6 +293,149 @@ public sealed class DisasterApiTests : IDisposable
         Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync("/api/desastres", new { nombre = "Sin evidencia", ubicacion = "Bogotá",
             severidad = 4, descripcion = "Conservar", latitud = 4.7, longitud = -74 })).StatusCode);
         Assert.Equal(2, await db.Disasters.CountAsync());
+        var historicalPage = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync");
+        Assert.Equal(2, historicalPage.GetProperty("items").GetArrayLength());
+        Assert.All(historicalPage.GetProperty("items").EnumerateArray(), row =>
+            Assert.Equal(JsonValueKind.Null, row.GetProperty("registeredAt").ValueKind));
+    }
+
+    [Fact]
+    public void SynchronizationCannotConsumeTheEntireConnectionPool()
+    {
+        using var app = App(migrate: false).WithWebHostBuilder(builder => builder.UseSetting("Synchronization:ConcurrentRequests", "100"));
+        Assert.Throws<InvalidOperationException>(() => app.CreateClient());
+    }
+
+    private static object Operation(string name, string? key = null, object? disaster = null) => new {
+        clientRequestId = key ?? Guid.NewGuid().ToString(),
+        disaster = disaster ?? new { nombre = name, ubicacion = "Bogotá", severidad = 4, descripcion = "Lote",
+            latitud = 4.7, longitud = -74, radio = (double?)null }
+    };
+
+    [Fact]
+    public async Task BatchUploadAndPagedDeltaPreserveAll130OperationsAndCreationReceipts()
+    {
+        await using var app = App(); await using var peer = App(); using var client = app.CreateClient(); using var retry = peer.CreateClient();
+        var operations = Enumerable.Range(0, 130).Select(i => Operation("Lote " + i)).ToArray();
+        foreach (var batch in operations.Chunk(50))
+        {
+            var response = await client.PostAsJsonAsync("/api/desastres/batch", new { operations = batch });
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var results = (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("results");
+            Assert.Equal(batch.Length, results.GetArrayLength());
+            Assert.All(results.EnumerateArray(), result => {
+                Assert.Equal("Created", result.GetProperty("status").GetString());
+                Assert.True(Guid.TryParse(result.GetProperty("clientRequestId").GetString(), out _));
+                Assert.True(result.GetProperty("disaster").GetProperty("id").GetInt32() > 0);
+            });
+        }
+        var repeated = await retry.PostAsJsonAsync("/api/desastres/batch", new { operations = operations.Take(50) });
+        Assert.All((await repeated.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("results").EnumerateArray(),
+            result => Assert.Equal("AlreadyProcessed", result.GetProperty("status").GetString()));
+        var ids = new HashSet<int>(); string? cursor = null; int pages = 0;
+        do {
+            var page = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?limit=50" + (cursor is null ? "" : "&cursor=" + Uri.EscapeDataString(cursor)));
+            Assert.InRange(page.GetProperty("items").GetArrayLength(), 1, 50);
+            foreach (var row in page.GetProperty("items").EnumerateArray()) Assert.True(ids.Add(row.GetProperty("id").GetInt32()));
+            cursor = page.GetProperty("nextCursor").GetString(); pages++;
+            if (!page.GetProperty("hasMore").GetBoolean()) break;
+        } while (true);
+        Assert.Equal(3, pages); Assert.Equal(130, ids.Count);
+        var empty = await retry.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(cursor!));
+        Assert.Empty(empty.GetProperty("items").EnumerateArray()); Assert.Equal(cursor, empty.GetProperty("nextCursor").GetString());
+        var id = ids.First(); Authenticate(client, id);
+        var current = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}");
+        var fields = JsonSerializer.Deserialize<Dictionary<string, object>>(current.ToString())!;
+        fields["radio"] = 3456.75; fields["expectedVersion"] = current.GetProperty("version").GetInt64();
+        Assert.Equal(HttpStatusCode.OK, (await client.PutAsJsonAsync($"/api/desastres/{id}", fields)).StatusCode);
+        var changes = await retry.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(cursor!));
+        Assert.Equal(1, changes.GetProperty("items").GetArrayLength()); Assert.Equal(3456.75, changes.GetProperty("items")[0].GetProperty("radio").GetDouble());
+        Assert.Equal(2, changes.GetProperty("items")[0].GetProperty("version").GetInt64());
+        Assert.Equal(130, (await retry.GetFromJsonAsync<JsonElement>("/api/desastres")).GetArrayLength());
+    }
+
+    [Fact]
+    public async Task BatchFailuresAreIndividualAndDoNotPoisonFollowingScopes()
+    {
+        await using var app = App(); using var client = app.CreateClient();
+        using var scope = app.Services.CreateScope(); var db = scope.ServiceProvider.GetRequiredService<DisasterDbContext>();
+        await db.Database.ExecuteSqlRawAsync("ALTER TABLE disasters.\"Desastres\" ADD CONSTRAINT \"TestBatchFailure\" CHECK (\"Nombre\" <> 'Persistencia fallida')");
+        var key = Guid.NewGuid().ToString();
+        await client.PostAsJsonAsync("/api/desastres/batch", new { operations = new[] { Operation("Original", key) } });
+        var caseKey = Guid.NewGuid().ToString();
+        var caseInsensitive = JsonSerializer.SerializeToElement(new { CLIENTREQUESTID = caseKey, Disaster = new {
+            nombre = "Válido", ubicacion = "Local", severidad = 1, descripcion = "Local", latitud = 0, longitud = 0 } });
+        var response = await client.PostAsJsonAsync("/api/desastres/batch", new { operations = new[] {
+            (object)caseInsensitive, Operation("Validación", disaster: new { nombre = "Inválido", severidad = 8 }),
+            Operation("Tipo JSON inválido", disaster: new { severidad = 1.5 }),
+            Operation("Diferente", key), Operation("Persistencia fallida"), Operation("Después del fallo") } });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var results = (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("results");
+        Assert.Equal(new[] { "Created", "ValidationError", "ValidationError", "Conflict", "RetryableFailure", "Created" },
+            results.EnumerateArray().Select(x => x.GetProperty("status").GetString()).ToArray());
+        Assert.Equal(caseKey, results[0].GetProperty("clientRequestId").GetString());
+        Assert.Equal(3, await db.Disasters.CountAsync());
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.PostAsJsonAsync("/api/desastres/batch", new { operations = Array.Empty<object>() })).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.PostAsJsonAsync("/api/desastres/batch",
+            new { operations = Enumerable.Range(0, 51).Select(i => Operation(i.ToString())) })).StatusCode);
+        using var huge = new StringContent("{\"operations\":[],\"padding\":\"" + new string('x', 1_048_576) + "\"}", Encoding.UTF8, "application/json");
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, (await client.PostAsync("/api/desastres/batch", huge)).StatusCode);
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, (await client.PostAsync("/api/desastres/batch/", huge)).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync("/api/desastres/sync?limit=51")).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.GetAsync("/api/desastres/sync?cursor=invalid")).StatusCode);
+    }
+
+    [Fact]
+    public async Task BatchRetryAcrossInstancesNeverDuplicatesConcurrentCreations()
+    {
+        await using var app = App(); await using var peer = App(); using var first = app.CreateClient(); using var second = peer.CreateClient();
+        var body = new { operations = new[] { Operation("Concurrencia", Guid.NewGuid().ToString()) } };
+        var responses = await Task.WhenAll(first.PostAsJsonAsync("/api/desastres/batch", body), second.PostAsJsonAsync("/api/desastres/batch", body));
+        var statuses = new List<string>(); var ids = new List<int>();
+        foreach (var response in responses) {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var row = (await response.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("results")[0];
+            statuses.Add(row.GetProperty("status").GetString()!); ids.Add(row.GetProperty("disaster").GetProperty("id").GetInt32());
+        }
+        Assert.Equal(new[] { "AlreadyProcessed", "Created" }, statuses.OrderBy(x => x)); Assert.Equal(ids[0], ids[1]);
+    }
+
+    [Fact]
+    public async Task DeltaDoesNotSkipLateCommitsOrChangesFromTransactionsStartedEarlier()
+    {
+        await using var app = App(); using var client = app.CreateClient();
+        await using var older = new NpgsqlConnection(_connection); await older.OpenAsync();
+        await using var newer = new NpgsqlConnection(_connection); await newer.OpenAsync();
+        const string insert = "INSERT INTO disasters.\"Desastres\" (\"Nombre\",\"Ubicacion\",\"Severidad\",\"Descripcion\",\"Latitud\",\"Longitud\",\"RegisteredAt\",\"UpdatedAt\") VALUES (@name,'Local',1,'Local',0,0,TIMESTAMPTZ '2026-11-17 12:00:00+00',TIMESTAMPTZ '2026-11-17 12:00:00+00')";
+        await using (var first = await older.BeginTransactionAsync())
+        {
+            await using (var second = await newer.BeginTransactionAsync()) {
+                await using var command = new NpgsqlCommand(insert, newer, second); command.Parameters.AddWithValue("name", "Confirma primero");
+                await command.ExecuteNonQueryAsync(); await second.CommitAsync();
+            }
+            var page = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync");
+            var cursor = page.GetProperty("nextCursor").GetString();
+            await using var late = new NpgsqlCommand(insert, older, first); late.Parameters.AddWithValue("name", "Transacción anterior");
+            await late.ExecuteNonQueryAsync(); await first.CommitAsync();
+            var changes = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(cursor!));
+            Assert.Equal("Transacción anterior", changes.GetProperty("items")[0].GetProperty("nombre").GetString());
+            Assert.Equal(page.GetProperty("items")[0].GetProperty("updatedAt").GetString(),
+                changes.GetProperty("items")[0].GetProperty("updatedAt").GetString());
+        }
+        var before = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync");
+        var after = before.GetProperty("nextCursor").GetString();
+        await using var pending = await older.BeginTransactionAsync();
+        await using var write = new NpgsqlCommand(insert, older, pending); write.Parameters.AddWithValue("name", "Sin confirmar");
+        await write.ExecuteNonQueryAsync();
+        await using var following = await newer.BeginTransactionAsync();
+        await using var blocked = new NpgsqlCommand(insert, newer, following); blocked.Parameters.AddWithValue("name", "Espera revisión");
+        var waiting = blocked.ExecuteNonQueryAsync();
+        await Task.Delay(100); Assert.False(waiting.IsCompleted);
+        var interim = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(after!));
+        Assert.Empty(interim.GetProperty("items").EnumerateArray()); Assert.Equal(after, interim.GetProperty("nextCursor").GetString());
+        await pending.CommitAsync(); await waiting.WaitAsync(TimeSpan.FromSeconds(5)); await following.CommitAsync();
+        var final = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(after!));
+        Assert.Equal(new[] { "Sin confirmar", "Espera revisión" }, final.GetProperty("items").EnumerateArray().Select(x => x.GetProperty("nombre").GetString()));
     }
 
     public void Dispose()

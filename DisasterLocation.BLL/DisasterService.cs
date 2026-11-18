@@ -33,6 +33,31 @@ public sealed class DisasterService(IDisasterRepository repository)
     private static DateTimeOffset? Utc(DateTimeOffset? value) => value is null ? null
         : new DateTimeOffset(value.Value.UtcTicks - value.Value.UtcTicks % 10, TimeSpan.Zero);
 
+    public async Task<DisasterSyncResponse> GetChangesAsync(string? cursor, int limit, CancellationToken ct)
+    {
+        long after = 0;
+        if (cursor is not null)
+        {
+            try
+            {
+                if (cursor.Length > 64) throw new FormatException();
+                var value = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(cursor));
+                if (!value.StartsWith("1:") || !long.TryParse(value.AsSpan(2), System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out after) || after < 0 || Cursor(after) != cursor)
+                    throw new FormatException();
+            }
+            catch (FormatException)
+            {
+                throw new DisasterValidationException(new Dictionary<string, string[]> { ["cursor"] = ["Cursor de sincronización inválido."] });
+            }
+        }
+        var page = await repository.GetChangesAsync(after, limit, ct);
+        return new DisasterSyncResponse(page.Items.Select(ToResponse).ToArray(), Cursor(page.Cursor), page.HasMore);
+    }
+
+    private static string Cursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(
+        "1:" + value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+
     public async Task<IReadOnlyList<DisasterResponse>> GetAllAsync(CancellationToken ct = default) =>
         (await repository.GetAllAsync(ct)).Select(ToResponse).ToArray();
 

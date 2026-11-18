@@ -278,7 +278,7 @@ def main():
                     cursor.execute('SELECT COUNT(*) FROM "Desastres"')
                     assert cursor.fetchone()[0] == 7
                     cursor.execute('SELECT COUNT(*) FROM disasters."__EFMigrationsHistory_Disaster"')
-                    assert cursor.fetchone()[0] == 3
+                    assert cursor.fetchone()[0] == 4
                     try:
                         cursor.execute('UPDATE "Desastres" SET "ClientRequestId" = %s', (operation["Idempotency-Key"].upper(),))
                     except psycopg2.IntegrityError:
@@ -316,5 +316,168 @@ def main():
                     stop(process)
 
 
+def benchmark():
+    import threading
+    import statistics
+    import math
+    from http.client import HTTPResponse
+    rows = []
+    upload_samples = {"individual": [], "batch": []}
+    read_samples = {"individual": [], "batch": []}
+    operations = [{"clientRequestId": str(uuid.uuid4()), "disaster": {
+        "nombre": f"Medición {index}", "ubicacion": "Bogotá", "severidad": 4,
+        "descripcion": "Mismo contenido en ambos protocolos", "latitud": 4.7, "longitud": -74.0, "radio": 1234.75}}
+        for index in range(130)]
+
+    class MeasuredConnection(HTTPConnection):
+        def __init__(self, port):
+            super().__init__("127.0.0.1", port, timeout=35)
+            self.transferred = 0
+            owner = self
+            class Reader:
+                def __init__(self, stream): self.stream = stream
+                def read(self, *args):
+                    value = self.stream.read(*args); owner.transferred += len(value); return value
+                def readline(self, *args):
+                    value = self.stream.readline(*args); owner.transferred += len(value); return value
+                def __getattr__(self, name): return getattr(self.stream, name)
+            class Socket:
+                def __init__(self, sock): self.sock = sock
+                def makefile(self, *args, **kwargs): return Reader(self.sock.makefile(*args, **kwargs))
+            self.response_class = lambda sock, **kwargs: HTTPResponse(Socket(sock), **kwargs)
+        def send(self, data):
+            self.transferred += len(data)
+            return super().send(data)
+        def call(self, path, method="GET", body=None, headers=None):
+            encoded = None if body is None else json.dumps(body).encode()
+            values = {"Content-Type": "application/json"} if encoded else {}
+            values.update(headers or {})
+            start = time.perf_counter(); before = self.transferred
+            self.request(method, path, body=encoded, headers=values)
+            response = self.getresponse(); raw = response.read()
+            return response.status, json.loads(raw) if raw else None, (time.perf_counter()-start)*1000, self.transferred-before
+
+    def percentiles(values):
+        values = sorted(values)
+        return {str(p): values[min(len(values)-1, max(0, math.ceil(len(values)*p/100)-1))] for p in [50, 95, 99]}
+
+    for trial in range(3):
+        for mode in ["individual", "batch"]:
+            with test_database() as database, tempfile.TemporaryFile(mode="w+") as log:
+                processes = []; finished = threading.Event(); critical = []; errors = []; connections = []; phase = []
+                clients = []
+                try:
+                    migrate_database(database, log)
+                    a, g = free_port(), free_port()
+                    api = start("DisasterLocation", a, {"ConnectionStrings__Disasters": postgres_connection_string(database),
+                        "Security__LocalDemo": "true", "ASPNETCORE_ENVIRONMENT": "Development"}, log); processes.append(api); wait_ready(f"http://127.0.0.1:{a}", "/api/desastres", api)
+                    gateway = start("DisasterLocation.Gateway", g, {"ReverseProxy__Clusters__disasters-api__Destinations__local__Address": f"http://127.0.0.1:{a}/"}, log)
+                    processes.append(gateway); wait_ready(f"http://127.0.0.1:{g}", "/health", gateway)
+                    client = MeasuredConnection(g); clients.append(client)
+                    status, seed, _, _ = client.call("/api/desastres", "POST", {**operations[0]["disaster"], "nombre": "Crítico"})
+                    assert status == 201
+                    warm = {"clientRequestId": str(uuid.uuid4()), "disaster": {**operations[0]["disaster"], "nombre": "Calentamiento"}}
+                    status, warm_result, _, _ = client.call("/api/desastres/batch", "POST", {"operations": [warm]})
+                    assert status == 200
+                    warm_id = warm_result["results"][0]["disaster"]["id"]
+                    assert client.call(f"/api/desastres/{warm_id}/fase", "PUT", {"phase": "Assessment", "expectedVersion": 1})[0] == 200
+                    assert client.call("/api/desastres/sync?limit=1")[0] == 200
+                    assert client.call("/api/desastres")[0] == 200
+                    assert client.call(f"/api/desastres/{seed['id']}")[0] == 200
+                    def monitor():
+                        connection = psycopg2.connect(os.environ["TEST_POSTGRES_DSN"]); connection.autocommit = True
+                        try:
+                            with connection.cursor() as cursor:
+                                while not finished.is_set():
+                                    cursor.execute("SELECT count(*) FROM pg_stat_activity WHERE datname=%s",
+                                        (psycopg2.extensions.parse_dsn(database)["dbname"],))
+                                    connections.append(cursor.fetchone()[0]); finished.wait(.01)
+                        finally: connection.close()
+                    def interactive():
+                        reader = MeasuredConnection(g)
+                        try:
+                            while not finished.is_set():
+                                status, _, elapsed, _ = reader.call(f"/api/desastres/{seed['id']}")
+                                critical.append(elapsed)
+                                if status != 200: errors.append(status)
+                                finished.wait(.005)
+                        except Exception as error: errors.append(type(error).__name__)
+                        finally: reader.close()
+                    def change_phase():
+                        writer = MeasuredConnection(g)
+                        try:
+                            time.sleep(.02)
+                            status, _, elapsed, _ = writer.call(f"/api/desastres/{seed['id']}/fase", "PUT",
+                                {"phase": "Assessment", "expectedVersion": 1, "reason": "Medición local autorizada"})
+                            phase.append(elapsed)
+                            if status != 200: errors.append(status)
+                        except Exception as error: errors.append(type(error).__name__)
+                        finally: writer.close()
+                    threads = [threading.Thread(target=target) for target in [monitor, interactive, change_phase]]
+                    for thread in threads: thread.start()
+                    latencies = []; transferred = 0; upload_started = time.perf_counter()
+                    chunks = [operations[i:i+50] for i in range(0,130,50)] if mode == "batch" else [[item] for item in operations]
+                    for chunk in chunks:
+                        if mode == "batch":
+                            status, result, elapsed, count = client.call("/api/desastres/batch", "POST", {"operations": chunk})
+                            assert status == 200 and all(item["status"] == "Created" for item in result["results"])
+                        else:
+                            status, _, elapsed, count = client.call("/api/desastres", "POST", chunk[0]["disaster"],
+                                {"Idempotency-Key": chunk[0]["clientRequestId"]})
+                            assert status == 201
+                        latencies.append(elapsed); transferred += count
+                    duration = time.perf_counter()-upload_started
+                    finished.set()
+                    for thread in threads: thread.join(timeout=10); assert not thread.is_alive()
+                    assert not errors, errors
+                    initial_bytes = 0; initial_requests = 0; data = []; cursor = None
+                    while True:
+                        path = "/api/desastres" if mode == "individual" else "/api/desastres/sync" + ("?cursor=" + cursor if cursor else "")
+                        status, result, _, count = client.call(path); assert status == 200
+                        initial_requests += 1; initial_bytes += count
+                        data.extend(result if mode == "individual" else result["items"])
+                        if mode == "individual": break
+                        cursor = result["nextCursor"]
+                        if not result["hasMore"]: break
+                    assert len(data) == 132
+                    changed = sorted((item for item in data if item["id"] not in [seed["id"], warm_id]), key=lambda item: item["id"])[:5]
+                    for item in changed:
+                        body = {key: item[key] for key in ["nombre","ubicacion","severidad","descripcion","latitud","longitud","radio","disasterTypeId","startedAt","attentionLevel"]}
+                        body.update(expectedVersion=item["version"], radio=8765.25)
+                        assert client.call(f"/api/desastres/{item['id']}", "PUT", body)[0] == 200
+                    path = "/api/desastres" if mode == "individual" else "/api/desastres/sync?cursor="+cursor
+                    status, delta, _, delta_bytes = client.call(path); assert status == 200
+                    downloaded = delta if mode == "individual" else delta["items"]
+                    assert len(downloaded) == (132 if mode == "individual" else 5)
+                    if mode == "batch": cursor = delta["nextCursor"]
+                    status, unchanged, _, unchanged_bytes = client.call("/api/desastres" if mode == "individual" else "/api/desastres/sync?cursor="+cursor)
+                    assert status == 200
+                    if mode == "batch": assert unchanged["items"] == []
+                    row = {"trial": trial+1, "mode": mode, "records": 130, "uploadRequests": len(chunks),
+                        "uploadHttpBytes": transferred, "recordsPerSecond": 130/duration, "requestLatencyMs": percentiles(latencies),
+                        "criticalReadLatencyMs": percentiles(critical), "criticalReadSamples": len(critical),
+                        "criticalPhaseChangeMs": phase[0], "errors": len(errors), "peakPostgresConnections": max(connections),
+                        "initialDownloadRequests": initial_requests, "initialDownloadHttpBytes": initial_bytes,
+                        "incrementalDownloadRecords": len(downloaded), "incrementalDownloadHttpBytes": delta_bytes,
+                        "unchangedDownloadHttpBytes": unchanged_bytes}
+                    upload_samples[mode].extend(latencies); read_samples[mode].extend(critical)
+                    rows.append(row); print(json.dumps(row), flush=True)
+                finally:
+                    finished.set()
+                    for client in clients: client.close()
+                    for process in reversed(processes): stop(process)
+    summary = {}
+    for mode in ["individual", "batch"]:
+        summary[mode] = {key: (max if key == "peakPostgresConnections" else statistics.mean)(
+            row[key] for row in rows if row["mode"] == mode) for key in
+            ["uploadRequests","uploadHttpBytes","recordsPerSecond","peakPostgresConnections",
+             "initialDownloadHttpBytes","incrementalDownloadHttpBytes","unchangedDownloadHttpBytes"]}
+        summary[mode].update(requestLatencyMs=percentiles(upload_samples[mode]), requestSamples=len(upload_samples[mode]),
+            criticalReadLatencyMs=percentiles(read_samples[mode]), criticalReadSamples=len(read_samples[mode]),
+            criticalPhaseChangeMs=[row["criticalPhaseChangeMs"] for row in rows if row["mode"] == mode], errors=0)
+    print(json.dumps({"summary": summary}), flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    benchmark() if "--benchmark" in sys.argv else main()

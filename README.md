@@ -66,7 +66,7 @@ La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus
 
 Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y PostgreSQL está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
 
-La persistencia se distribuye mediante `DisasterPlatform.Core 2.0.0` y `DisasterPlatform.DAL 3.0.0`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. La API conserva los campos originales y añade `radio` nullable, `phase` y `version` a las respuestas. `radio` es opcional en la creación y, cuando se informa, debe ser mayor que cero y no superar 1.000.000 metros.
+La persistencia se distribuye mediante `DisasterPlatform.Core 3.0.0` y `DisasterPlatform.DAL 4.0.0`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. La API conserva los campos originales y añade `radio` nullable, `phase` y `version` a las respuestas. `radio` es opcional en la creación y, cuando se informa, debe ser mayor que cero y no superar 1.000.000 metros.
 
 Las migraciones se ejecutan explícitamente con una conexión administrativa separada. Con su archivo protegido indicado en `MIGRATION_CONNECTION_FILE`:
 
@@ -209,3 +209,21 @@ python3 scripts/smoke_test.py
 La prueba inicia API y gateway en puertos temporales y usa bases temporales. Comprueba el registro web y móvil, validación, reintentos `201/200`, conflictos `409`, solicitudes concurrentes, CORS y el índice único. También comprueba que un reintento conserva su ID tras reiniciar la API y que dos instancias comparten la misma operación idempotente. Las migraciones se aplican antes de iniciar las APIs de prueba. Al terminar detiene los procesos y elimina sus datos de prueba.
 
 Referencias: [YARP](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/getting-started?view=aspnetcore-10.0), [Npgsql con EF Core](https://www.npgsql.org/efcore/), [Leaflet 1.9](https://leafletjs.com/examples-v1/quick-start/).
+
+### Sincronización móvil
+
+POST /api/desastres/batch recibe operations, un arreglo de elementos con clientRequestId y disaster (el contrato de creación). Cada operación devuelve Created, AlreadyProcessed, ValidationError, Conflict o RetryableFailure, correlacionada por su UUID; las confirmaciones incluyen disaster.id y el recibo original. HTTP 200 del lote no confirma los elementos sin resultado válido. Se conserva el POST individual y su cabecera Idempotency-Key.
+
+Synchronization configura MaxBatchOperations (50), MaxBatchBodyBytes (1048576), MaxPageSize (50) y ConcurrentRequests (2). La concurrencia de sincronización debe ser menor que Maximum Pool Size para reservar conexiones a operaciones interactivas. Las operaciones del lote utilizan scopes independientes y se procesan secuencialmente, sin una transacción compartida.
+
+GET /api/desastres/sync acepta cursor opaco opcional y limit. Devuelve items, nextCursor y hasMore. La primera consulta inicia la carga paginada; las siguientes usan exclusivamente el cursor confirmado. Un índice sobre SyncSequence limita las lecturas. PostgreSQL asigna la revisión bajo un advisory lock transaccional antes de modificar filas, evitando avanzar por delante de cambios sin confirmar. La secuencia conserva CACHE 1, incremento 1 y NO CYCLE; estas propiedades forman parte de la garantía del cursor. Esto serializa brevemente las escrituras del dominio; no mantiene una transacción entre páginas ni conserva un historial de cambios. Los registros que cambian durante la paginación pueden reaparecer con una versión mayor. El protocolo no propaga eliminaciones: el servicio no ofrece una operación de borrado.
+
+La migración incremental incorpora filas históricas sin alterar versiones, fechas ni recibos de creación. El rol de ejecución necesita USAGE sobre la secuencia disasters."DisasterSyncSequence"; las credenciales de migración siguen separadas. Core 3 y DAL 4 reflejan la ampliación del contrato del repositorio; Security permanece en 1.0.0.
+
+Para comparar ambos protocolos sobre PostgreSQL local aislado, con las aplicaciones ya compiladas:
+
+```bash
+python3 scripts/smoke_test.py --benchmark
+```
+
+El comando utiliza TEST_POSTGRES_DSN, crea y elimina sus propias bases y procesos, y realiza tres repeticiones intercaladas por protocolo. Cada repetición calienta las rutas, registra 130 operaciones, mantiene consultas y un cambio de fase concurrentes, descarga inicialmente 132 registros (incluidos dos de calentamiento) y actualiza cinco. Mide solicitudes, bytes HTTP (cabeceras, cuerpos y framing HTTP; sin TCP/TLS), registros por segundo, percentiles por solicitud, errores y conexiones PostgreSQL. Los tiempos por lote incluyen hasta 50 operaciones; no son latencias por registro ni una validación de los objetivos de disponibilidad o concurrencia del enunciado.

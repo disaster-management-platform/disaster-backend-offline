@@ -25,3 +25,11 @@ public sealed record UpdateDisasterRequest(string? Nombre, string? Ubicacion, in
 public sealed record CreateDisasterTypeRequest(string? Name);
 
 public sealed record DisasterTypeResponse(int Id, string Name, bool IsActive);
+
+public sealed record BatchDisasterRequest(System.Text.Json.JsonElement[]? Operations);
+public sealed record BatchDisasterOperation(string? ClientRequestId, CreateDisasterRequest? Disaster);
+public enum BatchDisasterStatus { Created, AlreadyProcessed, ValidationError, Conflict, RetryableFailure }
+public sealed record BatchDisasterResult(string? ClientRequestId, BatchDisasterStatus Status,
+    DisasterResponse? Disaster = null, IDictionary<string, string[]>? Errors = null);
+public sealed record BatchDisasterResponse(IReadOnlyList<BatchDisasterResult> Results);
+public sealed record DisasterSyncResponse(IReadOnlyList<DisasterResponse> Items, string NextCursor, bool HasMore);

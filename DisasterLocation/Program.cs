@@ -5,6 +5,9 @@ using Platform.DAL;
 using Platform.Security;
 using Reconstruction.Application.Ports;
 using System.Text.Json.Serialization;
+using System.Text.Json;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 var connectionString = builder.Configuration.GetConnectionString("Disasters")
@@ -14,6 +17,27 @@ if (builder.Configuration.GetValue<bool>("Database:Migrate"))
     await PlatformDatabase.MigrateAsync(connectionString);
     return;
 }
+var maxOperations = builder.Configuration.GetValue<int>("Synchronization:MaxBatchOperations", 50);
+var maxBodyBytes = builder.Configuration.GetValue<long>("Synchronization:MaxBatchBodyBytes", 1_048_576);
+var maxPageSize = builder.Configuration.GetValue<int>("Synchronization:MaxPageSize", 50);
+var syncConcurrency = builder.Configuration.GetValue<int>("Synchronization:ConcurrentRequests", 2);
+if (syncConcurrency < 1 || syncConcurrency >= new Npgsql.NpgsqlConnectionStringBuilder(connectionString).MaxPoolSize)
+    throw new InvalidOperationException("Reserve conexiones PostgreSQL para las operaciones interactivas.");
+if (maxOperations <= 0 || maxBodyBytes <= 0 || maxPageSize <= 0) throw new InvalidOperationException("Límites de sincronización inválidos.");
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = 429;
+    options.AddConcurrencyLimiter("synchronization", limiter =>
+    {
+        limiter.PermitLimit = syncConcurrency;
+        limiter.QueueLimit = 0;
+    });
+    options.OnRejected = async (context, _) =>
+    {
+        context.HttpContext.Response.Headers.RetryAfter = "1";
+        await Results.Problem(statusCode: 429, title: "Sincronización ocupada").ExecuteAsync(context.HttpContext);
+    };
+});
 builder.Services.AddOpenApi();
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddProblemDetails();
@@ -26,6 +50,18 @@ builder.Services.AddAuthorization(options => options.AddPolicy("DisasterAdminist
         || (localDemo && context.User.HasClaim("local_demo", "true")))));
 
 var app = builder.Build();
+app.UseRouting();
+app.UseRateLimiter();
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/api/desastres/batch", StringComparison.OrdinalIgnoreCase))
+    {
+        if (context.Request.ContentLength > maxBodyBytes) { context.Response.StatusCode = 413; return; }
+        if (context.Features.Get<IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } size)
+            size.MaxRequestBodySize = maxBodyBytes;
+    }
+    await next(context);
+});
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseExceptionHandler(handler => handler.Run(async context =>
@@ -42,6 +78,51 @@ var disasters = app.MapGroup("/api/desastres").WithTags("Desastres");
 disasters.MapGet("/", async (DisasterService service, CancellationToken ct) =>
     Results.Ok(await service.GetAllAsync(ct)))
     .WithSummary("Lista los desastres registrados.");
+
+disasters.MapGet("/sync", async (string? cursor, int? limit, DisasterService service, CancellationToken ct) =>
+{
+    var pageSize = limit ?? maxPageSize;
+    if (pageSize < 1 || pageSize > maxPageSize)
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["limit"] = [$"El tamaño de página debe estar entre 1 y {maxPageSize}."] });
+    try { return Results.Ok(await service.GetChangesAsync(cursor, pageSize, ct)); }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+}).RequireRateLimiting("synchronization");
+
+disasters.MapPost("/batch", async (BatchDisasterRequest request, IServiceScopeFactory scopes,
+    Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions> json,
+    ILogger<Program> logger, CancellationToken ct) =>
+{
+    if (request.Operations is null || request.Operations.Length < 1 || request.Operations.Length > maxOperations)
+        return Results.ValidationProblem(new Dictionary<string, string[]> { ["operations"] = [$"Envíe entre 1 y {maxOperations} operaciones."] });
+    var results = new List<BatchDisasterResult>(request.Operations.Length);
+    foreach (var item in request.Operations)
+    {
+        ct.ThrowIfCancellationRequested();
+        string? key = null;
+        if (item.ValueKind == JsonValueKind.Object)
+            foreach (var property in item.EnumerateObject())
+                if (property.Name.Equals("clientRequestId", StringComparison.OrdinalIgnoreCase)
+                    && property.Value.ValueKind == JsonValueKind.String) key = property.Value.GetString();
+        try
+        {
+            var operation = item.Deserialize<BatchDisasterOperation>(json.Value.SerializerOptions);
+            if (operation?.ClientRequestId is null || operation.Disaster is null) throw new JsonException();
+            await using var scope = scopes.CreateAsyncScope();
+            var saved = await scope.ServiceProvider.GetRequiredService<DisasterService>()
+                .CreateAsync(operation.Disaster, operation.ClientRequestId, ct);
+            results.Add(new(key, saved.Created ? BatchDisasterStatus.Created : BatchDisasterStatus.AlreadyProcessed, saved.Disaster));
+        }
+        catch (JsonException) { results.Add(new(key, BatchDisasterStatus.ValidationError, Errors: new Dictionary<string, string[]> { ["operation"] = ["Operación de creación incompleta o inválida."] })); }
+        catch (DisasterValidationException e) { results.Add(new(key, BatchDisasterStatus.ValidationError, Errors: e.Errors)); }
+        catch (DisasterConflictException e) { results.Add(new(key, BatchDisasterStatus.Conflict, Errors: new Dictionary<string, string[]> { ["operation"] = [e.Message] })); }
+        catch (Exception e) when (PlatformDatabase.IsPersistenceFailure(e))
+        {
+            logger.LogWarning("Batch persistence failed for operation {ClientRequestId}, error {ErrorType}", key, e.GetType().Name);
+            results.Add(new(key, BatchDisasterStatus.RetryableFailure));
+        }
+    }
+    return Results.Ok(new BatchDisasterResponse(results));
+}).RequireRateLimiting("synchronization");
 
 disasters.MapGet("/{id:int}", async (int id, DisasterService service, CancellationToken ct) =>
 {
