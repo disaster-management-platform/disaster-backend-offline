@@ -20,21 +20,23 @@ public sealed class DisasterDispatcher(IServiceScopeFactory scopes, IConfigurati
                 {
                     await using var scope = scopes.CreateAsyncScope();
                     var store = scope.ServiceProvider.GetRequiredService<DisasterCommandStore>();
-                    foreach (var command in await store.ClaimCommandsAsync(ct))
+                    foreach (var item in await store.ClaimEventsAsync(config.GetValue<int>("Ingestion:DispatchBatchSize", 10), ct))
                     {
-                        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct); timeout.CancelAfter(TimeSpan.FromSeconds(10));
-                        await channel.BasicPublishAsync(DisasterBroker.Commands, "create", true,
-                            new BasicProperties { MessageId = command.ClientRequestId.ToString(), DeliveryMode = DeliveryModes.Persistent },
-                            Encoding.UTF8.GetBytes(command.ClientRequestId.ToString()), timeout.Token);
-                        await store.ConfirmCommandAsync(command.ClientRequestId, command.LeaseId, ct);
-                    }
-                    foreach (var item in await store.ClaimEventsAsync(ct))
-                    {
+                        if (await store.RenewEventAsync(item.Id, item.LeaseId, ct) == 0) continue;
                         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct); timeout.CancelAfter(TimeSpan.FromSeconds(10));
                         var body = JsonSerializer.SerializeToUtf8Bytes(new { item.Id, Type = item.EventType, item.DisasterId, item.Version, item.OccurredAt, Payload = JsonSerializer.Deserialize<JsonElement>(item.Payload) });
                         await channel.BasicPublishAsync(DisasterBroker.Events, item.EventType, true,
                             new BasicProperties { MessageId = item.Id.ToString(), ContentType = "application/json", DeliveryMode = DeliveryModes.Persistent }, body, timeout.Token);
                         await store.ConfirmEventAsync(item.Id, item.LeaseId, ct);
+                    }
+                    foreach (var command in await store.ClaimCommandsAsync(config.GetValue<int>("Ingestion:DispatchBatchSize", 10), ct))
+                    {
+                        if (await store.RenewCommandAsync(command.ClientRequestId, command.LeaseId, ct) == 0) continue;
+                        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct); timeout.CancelAfter(TimeSpan.FromSeconds(10));
+                        await channel.BasicPublishAsync(DisasterBroker.Commands, "create", true,
+                            new BasicProperties { MessageId = command.ClientRequestId.ToString(), DeliveryMode = DeliveryModes.Persistent },
+                            Encoding.UTF8.GetBytes(command.ClientRequestId.ToString()), timeout.Token);
+                        await store.ConfirmCommandAsync(command.ClientRequestId, command.LeaseId, ct);
                     }
                     await Task.Delay(config.GetValue<int>("Ingestion:PublishIntervalMilliseconds", 500), ct);
                 }

@@ -57,7 +57,7 @@ public sealed class DisasterConsumers(IServiceScopeFactory scopes, IConfiguratio
             var store = scope.ServiceProvider.GetRequiredService<DisasterCommandStore>();
             var receipt = await store.GetAsync(id, ct);
             if (receipt is null) { await channel.BasicNackAsync(delivery.DeliveryTag, false, false, ct); return; }
-            if (receipt.ResultJson is string previous && JsonSerializer.Deserialize<BatchDisasterResult>(previous, AsyncBatchAcceptance.Json)?.Status != BatchDisasterStatus.RetryableFailure) {
+            if (receipt.ResultJson is not null) {
                 await channel.BasicAckAsync(delivery.DeliveryTag, false, ct); return;
             }
             BatchDisasterResult result;
@@ -73,7 +73,7 @@ public sealed class DisasterConsumers(IServiceScopeFactory scopes, IConfiguratio
                 if (attempt < 3) { await Task.Delay(500 * attempt, ct); continue; }
                 result = new(id.ToString(), BatchDisasterStatus.RetryableFailure);
             }
-            await store.FinishAsync(id, JsonSerializer.Serialize(result, AsyncBatchAcceptance.Json), ct);
+            await store.FinishAsync(id, JsonSerializer.Serialize(result, AsyncBatchAcceptance.Json), receipt.RecoveryCount, config.GetValue<int>("Ingestion:RecoveryDelaySeconds", 10), ct);
             if (result.Status == BatchDisasterStatus.RetryableFailure) await channel.BasicNackAsync(delivery.DeliveryTag, false, false, ct);
             else await channel.BasicAckAsync(delivery.DeliveryTag, false, ct);
             return;

@@ -57,7 +57,10 @@ builder.Services.AddAuthorization(options => options.AddPolicy("DisasterIntegrat
         || (localDemo && context.User.HasClaim("local_demo", "true")))));
 
 var consumers = builder.Configuration.GetValue<int>("Ingestion:Consumers", 2);
-if (consumers < 1 || consumers > 8 || consumers + syncConcurrency >= new Npgsql.NpgsqlConnectionStringBuilder(connectionString).MaxPoolSize
+if (builder.Configuration.GetValue<int>("Ingestion:MaxRecoveries", 3) is < 0 or > 10
+    || builder.Configuration.GetValue<int>("Ingestion:RecoveryDelaySeconds", 10) is < 1 or > 3600
+    || builder.Configuration.GetValue<int>("Ingestion:DispatchBatchSize", 10) is < 1 or > 50
+    || consumers < 1 || consumers > 8 || consumers + syncConcurrency >= new Npgsql.NpgsqlConnectionStringBuilder(connectionString).MaxPoolSize
     || builder.Configuration.GetValue<int>("Ingestion:Capacity", 10000) < 1
     || builder.Configuration.GetValue<int>("Ingestion:PublishIntervalMilliseconds", 500) < 100)
     throw new InvalidOperationException("Límites de ingestión inválidos; reserve capacidad interactiva.");

@@ -1,4 +1,5 @@
 """Small real PostgreSQL/RabbitMQ ingestion recovery scenario; local resources only."""
+from concurrent.futures import ThreadPoolExecutor
 import base64
 from contextlib import closing
 import json
@@ -29,7 +30,7 @@ def main():
             log = tempfile.TemporaryFile(mode='w+')
             migrate_database(database, log)
             env = {'ConnectionStrings__Disasters':postgres_connection_string(database), 'Ingestion__VirtualHost':vhost,
-                   'Security__LocalDemo':'true','ASPNETCORE_ENVIRONMENT':'Development'}
+                   'Ingestion__RecoveryDelaySeconds':'1','Ingestion__MaxRecoveries':'2','Ingestion__DispatchBatchSize':'10','Security__LocalDemo':'true','ASPNETCORE_ENVIRONMENT':'Development'}
             def launch(**settings):
                 port=free_port(); process=start('DisasterLocation',port,{**env,**settings},log);processes.append(process)
                 base=f'http://127.0.0.1:{port}';wait_ready(base,'/api/desastres',process);return base
@@ -91,12 +92,52 @@ def main():
             assert dead
             with closing(psycopg2.connect(database)) as conn,conn.cursor() as cursor:
                 cursor.execute('ALTER TABLE disasters."Desastres" DROP CONSTRAINT "TemporaryFailure"');conn.commit()
-            assert broker('exchanges/'+vhost+'/disasters.commands/publish','POST',{'properties':{'delivery_mode':2},'routing_key':'create','payload':dead[0]['payload'],'payload_encoding':dead[0]['payload_encoding']})['routed']
+            time.sleep(1.1)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                statuses=[r[0] for r in pool.map(lambda _:submit(failed_body),range(4))]
+                assert all(code in (200,202,429) for code in statuses) and any(code in (200,202) for code in statuses)
             for _ in range(100):
                 if final(failed_body)['status']=='Created':break
                 time.sleep(.1)
             assert final(failed_body)['status']=='Created'
-            print('PASS: durable acceptance without broker, two consumers, replay, ACK loss, bounded retries, DLQ recovery, Outbox and Delta')
+            recovered=final(failed_body)
+            with closing(psycopg2.connect(database)) as conn,conn.cursor() as cursor:
+                cursor.execute('SELECT "RecoveryCount" FROM disasters."DisasterCommandReceipts" WHERE "ClientRequestId"=%s',(failed,));assert cursor.fetchone()[0]==1
+            assert broker('exchanges/'+vhost+'/disasters.commands/publish','POST',{'properties':{'delivery_mode':2},'routing_key':'create','payload':dead[0]['payload'],'payload_encoding':dead[0]['payload_encoding']})['routed']
+            assert final(failed_body)==recovered
+            ids=[str(uuid.uuid4()) for _ in range(10)]
+            burst={'operations':[{'clientRequestId':key,'disaster':{**payload,'nombre':'Burst '+key}} for key in ids]}
+            assert submit(burst)[0]==202
+            for _ in range(100):
+                with closing(psycopg2.connect(database)) as conn,conn.cursor() as cursor:
+                    cursor.execute('SELECT count(*),EXTRACT(EPOCH FROM max("PublishedAt")-min("PublishedAt")) FROM disasters."DisasterCommandReceipts" WHERE "ClientRequestId"=ANY(%s::uuid[]) AND "PublishedAt" IS NOT NULL',(ids,))
+                    count,span=cursor.fetchone()
+                    if count==10:break
+                time.sleep(.1)
+            assert count==10 and span<2, (count,span)
+            exhausted=str(uuid.uuid4());exhausted_body={'operations':[{'clientRequestId':exhausted,'disaster':{**payload,'nombre':'DLQ'}}]}
+            with closing(psycopg2.connect(database)) as conn,conn.cursor() as cursor:
+                cursor.execute("ALTER TABLE disasters.\"Desastres\" ADD CONSTRAINT \"PersistentFailure\" CHECK (\"Nombre\" <> 'DLQ' OR \"ClientRequestId\" <> %s)",(exhausted,));conn.commit()
+            for _ in range(200):
+                code,_,result=submit(exhausted_body)
+                if (result['results'][0].get('errors') or {}).get('recoveryExhausted'):break
+                time.sleep(.1)
+            else:raise AssertionError('Recovery limit not enforced')
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                statuses=[r[0] for r in pool.map(lambda _:submit(exhausted_body),range(4))]
+                assert all(code in (200,429) for code in statuses) and 200 in statuses
+            with closing(psycopg2.connect(database)) as conn,conn.cursor() as cursor:
+                cursor.execute('SELECT "RecoveryCount","ResultJson"->>\'status\' FROM disasters."DisasterCommandReceipts" WHERE "ClientRequestId"=%s',(exhausted,))
+                assert cursor.fetchone()==(2,'RetryableFailure')
+                cursor.execute('SELECT count(*) FROM disasters."Desastres" WHERE "ClientRequestId"=%s',(failed,));assert cursor.fetchone()[0]==1
+            limited=launch(Ingestion__Capacity='1')
+            with closing(psycopg2.connect(database)) as conn,conn.cursor() as cursor:
+                cursor.execute('INSERT INTO disasters."DisasterCommandReceipts" ("ClientRequestId","CommandJson","ReceivedAt","PublishedAt","Attempts","RecoveryCount") VALUES (%s,%s::jsonb,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0,0)',(str(uuid.uuid4()),json.dumps(payload)))
+                cursor.execute('UPDATE disasters."DisasterCommandReceipts" SET "RecoveryCount"=0,"NextRecoveryAt"=CURRENT_TIMESTAMP WHERE "ClientRequestId"=%s',(exhausted,));conn.commit()
+            assert request(limited,'/api/desastres/batch','POST',exhausted_body,{'Prefer':'respond-async'})[0]==503
+            with closing(psycopg2.connect(database)) as conn,conn.cursor() as cursor:
+                cursor.execute('SELECT "RecoveryCount","ResultJson" IS NOT NULL FROM disasters."DisasterCommandReceipts" WHERE "ClientRequestId"=%s',(exhausted,));assert cursor.fetchone()==(0,True)
+            print('PASS: ordinary retry recovery without broker administration, bounded recovery, concurrent retries, stale DLQ, batch dispatch and confirmed events')
     finally:
         if 'log' in locals() and sys.exc_info()[0] is not None:
             log.flush(); log.seek(0); print(log.read()[-8000:])

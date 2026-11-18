@@ -27,10 +27,15 @@ public sealed class AsyncBatchAcceptance(IServiceScopeFactory scopes, IConfigura
                 var command = DisasterService.CreationCommand(operation.Disaster);
                 await using var scope = scopes.CreateAsyncScope();
                 var store = scope.ServiceProvider.GetRequiredService<DisasterCommandStore>();
-                var accepted = await store.AcceptAsync(id, command, config.GetValue<int>("Ingestion:Capacity", 10000), ct);
+                var accepted = await store.AcceptAsync(id, command, config.GetValue<int>("Ingestion:Capacity", 10000), ct, config.GetValue<int>("Ingestion:MaxRecoveries", 3));
                 if (accepted.Conflict) { results.Add(new(key, BatchDisasterStatus.Conflict)); continue; }
                 if (accepted.Receipt is null) { unaccepted++; results.Add(new(key, BatchDisasterStatus.RetryableFailure)); continue; }
-                if (accepted.Receipt.ResultJson is string result) results.Add((JsonSerializer.Deserialize<BatchDisasterResult>(result, Json)!) with { ClientRequestId = key });
+                if (accepted.Receipt.ResultJson is string result) {
+                    var saved = JsonSerializer.Deserialize<BatchDisasterResult>(result, Json)!;
+                    if (saved.Status == BatchDisasterStatus.RetryableFailure && accepted.Receipt.RecoveryCount >= config.GetValue<int>("Ingestion:MaxRecoveries", 3))
+                        saved = saved with { Errors = new Dictionary<string,string[]> { ["recoveryExhausted"] = ["Recuperación automática agotada; requiere intervención administrativa. Se conserva el comando original."] } };
+                    results.Add(saved with { ClientRequestId = key });
+                }
                 else results.Add(new(key, accepted.Receipt.PublishedAt is null ? BatchDisasterStatus.Accepted : BatchDisasterStatus.Processing));
             }
             catch (JsonException) { results.Add(new(key, BatchDisasterStatus.ValidationError, Errors: new Dictionary<string,string[]> { ["operation"] = ["UUID o comando inválido."] })); }
