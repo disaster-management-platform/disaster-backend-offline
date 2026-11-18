@@ -67,6 +67,13 @@ public sealed partial class DisasterService(IDisasterRepository repository)
         return disaster is null ? null : ToResponse(disaster);
     }
 
+    public static string CreationCommand(CreateDisasterRequest request)
+    {
+        var value = Normalize(request, null);
+        return JsonSerializer.Serialize(request with { Nombre = value.Nombre, Ubicacion = value.Ubicacion,
+            Descripcion = value.Descripcion, StartedAt = value.StartedAt });
+    }
+
     private static Disaster Normalize(CreateDisasterRequest request, string? idempotencyKey)
     {
         var errors = new Dictionary<string, string[]>();

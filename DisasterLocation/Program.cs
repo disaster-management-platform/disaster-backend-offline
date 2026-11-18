@@ -1,3 +1,5 @@
+using DisasterLocation.Messaging;
+using Platform.DAL.Repositories.Disasters;
 using DisasterLocation.BLL;
 using DisasterLocation.Core;
 using DisasterLocation.DAL;
@@ -54,6 +56,14 @@ builder.Services.AddAuthorization(options => options.AddPolicy("DisasterIntegrat
         context.User.IsInRole("disasters.integration") || context.User.IsInRole("disasters.admin")
         || (localDemo && context.User.HasClaim("local_demo", "true")))));
 
+var consumers = builder.Configuration.GetValue<int>("Ingestion:Consumers", 2);
+if (consumers < 1 || consumers > 8 || consumers + syncConcurrency >= new Npgsql.NpgsqlConnectionStringBuilder(connectionString).MaxPoolSize
+    || builder.Configuration.GetValue<int>("Ingestion:Capacity", 10000) < 1
+    || builder.Configuration.GetValue<int>("Ingestion:PublishIntervalMilliseconds", 500) < 100)
+    throw new InvalidOperationException("Límites de ingestión inválidos; reserve capacidad interactiva.");
+builder.Services.AddScoped<AsyncBatchAcceptance>();
+if (builder.Configuration.GetValue<bool>("Ingestion:DispatcherEnabled")) builder.Services.AddHostedService<DisasterDispatcher>();
+if (builder.Configuration.GetValue<bool>("Ingestion:ConsumersEnabled")) builder.Services.AddHostedService<DisasterConsumers>();
 var app = builder.Build();
 app.UseRouting();
 app.UseRateLimiter();
@@ -93,12 +103,14 @@ disasters.MapGet("/sync", async (string? cursor, int? limit, DisasterService ser
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
 }).RequireRateLimiting("synchronization");
 
-disasters.MapPost("/batch", async (BatchDisasterRequest request, IServiceScopeFactory scopes,
+disasters.MapPost("/batch", async (BatchDisasterRequest request, HttpContext http, AsyncBatchAcceptance acceptance, IServiceScopeFactory scopes,
     Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions> json,
     ILogger<Program> logger, CancellationToken ct) =>
 {
     if (request.Operations is null || request.Operations.Length < 1 || request.Operations.Length > maxOperations)
         return Results.ValidationProblem(new Dictionary<string, string[]> { ["operations"] = [$"Envíe entre 1 y {maxOperations} operaciones."] });
+    if (http.Request.Headers["Prefer"].ToString().Split(',').Any(x => x.Trim().Equals("respond-async", StringComparison.OrdinalIgnoreCase)))
+        return await acceptance.AcceptAsync(request, http.Response, ct);
     var results = new List<BatchDisasterResult>(request.Operations.Length);
     foreach (var item in request.Operations)
     {

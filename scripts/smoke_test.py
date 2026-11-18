@@ -278,7 +278,7 @@ def main():
                     cursor.execute('SELECT COUNT(*) FROM "Desastres"')
                     assert cursor.fetchone()[0] == 7
                     cursor.execute('SELECT COUNT(*) FROM disasters."__EFMigrationsHistory_Disaster"')
-                    assert cursor.fetchone()[0] == 5
+                    assert cursor.fetchone()[0] == 6
                     try:
                         cursor.execute('UPDATE "Desastres" SET "ClientRequestId" = %s', (operation["Idempotency-Key"].upper(),))
                     except psycopg2.IntegrityError:
