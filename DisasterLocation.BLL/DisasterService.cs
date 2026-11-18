@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace DisasterLocation.BLL;
 
-public sealed class DisasterService(IDisasterRepository repository)
+public sealed partial class DisasterService(IDisasterRepository repository)
 {
     private static readonly IReadOnlyDictionary<DisasterPhase, DisasterPhase[]> Transitions =
         new Dictionary<DisasterPhase, DisasterPhase[]>
@@ -193,5 +193,8 @@ public sealed class DisasterService(IDisasterRepository repository)
     private static DisasterResponse ToResponse(Disaster disaster) => new(
         disaster.Id, disaster.Nombre, disaster.Ubicacion, disaster.Severidad,
         disaster.Descripcion, disaster.Latitud, disaster.Longitud, disaster.Radio, disaster.Phase.ToString(), disaster.Version,
-        disaster.DisasterTypeId, disaster.StartedAt, disaster.RegisteredAt, disaster.UpdatedAt, (int?)disaster.AttentionLevel);
+        disaster.DisasterTypeId, disaster.StartedAt, disaster.RegisteredAt, disaster.UpdatedAt, (int?)disaster.AttentionLevel,
+        disaster.RegisteringOrganizationId, disaster.EmergencyResponsibleId,
+        disaster.GeographyJson is null ? null : JsonSerializer.Deserialize<DisasterGeography>(disaster.GeographyJson),
+        disaster.OrganizationsJson is null ? null : JsonSerializer.Deserialize<DisasterOrganization[]>(disaster.OrganizationsJson));
 }

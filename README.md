@@ -66,7 +66,7 @@ La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus
 
 Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y PostgreSQL está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
 
-La persistencia se distribuye mediante `DisasterPlatform.Core 3.0.0` y `DisasterPlatform.DAL 4.0.0`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. La API conserva los campos originales y añade `radio` nullable, `phase` y `version` a las respuestas. `radio` es opcional en la creación y, cuando se informa, debe ser mayor que cero y no superar 1.000.000 metros.
+La persistencia se distribuye mediante `DisasterPlatform.Core 4.0.0` y `DisasterPlatform.DAL 5.0.0`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. La API conserva los campos originales y añade `radio` nullable, `phase` y `version` a las respuestas. `radio` es opcional en la creación y, cuando se informa, debe ser mayor que cero y no superar 1.000.000 metros.
 
 Las migraciones se ejecutan explícitamente con una conexión administrativa separada. Con su archivo protegido indicado en `MIGRATION_CONNECTION_FILE`:
 
@@ -227,3 +227,15 @@ python3 scripts/smoke_test.py --benchmark
 ```
 
 El comando utiliza TEST_POSTGRES_DSN, crea y elimina sus propias bases y procesos, y realiza tres repeticiones intercaladas por protocolo. Cada repetición calienta las rutas, registra 130 operaciones, mantiene consultas y un cambio de fase concurrentes, descarga inicialmente 132 registros (incluidos dos de calentamiento) y actualiza cinco. Mide solicitudes, bytes HTTP (cabeceras, cuerpos y framing HTTP; sin TCP/TLS), registros por segundo, percentiles por solicitud, errores y conexiones PostgreSQL. Los tiempos por lote incluyen hasta 50 operaciones; no son latencias por registro ni una validación de los objetivos de disponibilidad o concurrencia del enunciado.
+
+### Procedencia, responsabilidades y geografía
+
+`POST /api/reportes-desastre` recibe `sourceKind` (`Internal`/`External`), `sourceId`, `sourceReportId` y `content` (objeto JSON, máximo 64 KiB). La identidad única es `(sourceId, sourceReportId)`: un reintento equivalente devuelve 200 y contenido distinto devuelve 409. Solo una fuente externa puede solicitar `createPreliminary: true`, acompañada de `disaster` con el contrato de creación canónico. El evento resultante comienza en `Detected`; el registro manual continúa en `Registered`. El organismo registrador puede identificarse en `registeringOrganizationId`. Se requiere el rol `disasters.integration` o `disasters.admin`, además de los claims de identidad existentes. No se implementan adaptadores de proveedores.
+
+`GET /api/reportes-desastre` consulta los reportes sin asociar. `GET /api/desastres/{id}/reportes` consulta los asociados. `PUT /api/desastres/{id}/reportes/{reportId}` recibe `expectedVersion` y asocia un reporte pendiente sin alterar su contenido ni reasignar reportes ya consolidados. Cada asociación incrementa la versión y registra su auditoría. Las consultas por desastre requieren lectura y acceso por desastre; las modificaciones requieren escritura y el mismo acceso.
+
+`PUT /api/desastres/{id}/organismos` recibe `expectedVersion`, `registeringOrganizationId`, `emergencyResponsibleId` y `organizations: [{organizationId, responsibility}]` (hasta 50 asociaciones). Son referencias estables a organismos o responsables externos; este servicio no administra sus registros maestros. Estas referencias no pueden asignarse mediante el POST anónimo histórico.
+
+`PUT /api/desastres/{id}/geografia` recibe `expectedVersion`, `sourceId` opcional y `geography: {polygon, municipalities, neighborhoods, riskZones}`. `polygon` admite GeoJSON `Polygon` WGS84 (longitud-latitud), con anillos cerrados y sin intersecciones; puede ser null. Se admiten hasta 2000 posiciones, 50 anillos, 100 nombres por lista y 64 KiB. Coordenadas y radio siguen actualizándose con el PUT existente. La auditoría conserva los valores anteriores y posteriores, responsable, fecha, versión y fuente cuando se conoce. No se completan datos históricos desconocidos.
+
+Los cambios de fase, atención y área, y las detecciones, se registran transaccionalmente en `disasters.DisasterOutboxMessages`. `GET /api/desastres/{id}/alertas` permite su consulta autorizada; todavía no hay entregas ni notificaciones enviadas. No se utilizan tablas de Reconstrucción. La asociación de reportes y las modificaciones de responsabilidades o geografía avanzan `Version` y `SyncSequence` dentro de la misma transacción; Delta Sync incluye las nuevas referencias, asociaciones y geografía. Los snapshots anteriores y el contenido de creación permanecen interpretables e inmutables.

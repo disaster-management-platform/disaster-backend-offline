@@ -8,6 +8,6 @@
     <ProjectReference Include="../DisasterLocation.Core/DisasterLocation.Core.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="DisasterPlatform.Core" Version="3.0.0" />
+    <PackageReference Include="DisasterPlatform.Core" Version="4.0.0" />
   </ItemGroup>
 </Project>

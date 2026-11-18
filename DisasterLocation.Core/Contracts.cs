@@ -11,7 +11,9 @@ public sealed record DisasterResponse(
     string Descripcion, double Latitud, double Longitud, double? Radio = null,
     string Phase = "Registered", long Version = 1,
     int? DisasterTypeId = null, DateTimeOffset? StartedAt = null, DateTimeOffset? RegisteredAt = null,
-    DateTimeOffset? UpdatedAt = null, int? AttentionLevel = null);
+    DateTimeOffset? UpdatedAt = null, int? AttentionLevel = null,
+    string? RegisteringOrganizationId = null, string? EmergencyResponsibleId = null,
+    DisasterGeography? Geography = null, IReadOnlyList<DisasterOrganization>? Organizations = null);
 
 public sealed record CreateDisasterResult(DisasterResponse Disaster, bool Created);
 
@@ -33,3 +35,14 @@ public sealed record BatchDisasterResult(string? ClientRequestId, BatchDisasterS
     DisasterResponse? Disaster = null, IDictionary<string, string[]>? Errors = null);
 public sealed record BatchDisasterResponse(IReadOnlyList<BatchDisasterResult> Results);
 public sealed record DisasterSyncResponse(IReadOnlyList<DisasterResponse> Items, string NextCursor, bool HasMore);
+
+public sealed record ReceiveDisasterReportRequest(InformationSourceKind? SourceKind, string? SourceId,
+    string? SourceReportId, System.Text.Json.JsonElement Content, bool CreatePreliminary = false,
+    CreateDisasterRequest? Disaster = null, string? RegisteringOrganizationId = null);
+public sealed record DisasterReportResponse(Guid Id, InformationSourceKind SourceKind, string SourceId,
+    string SourceReportId, DateTimeOffset ReceivedAt, string? RegisteringOrganizationId,
+    System.Text.Json.JsonElement Content, int? DisasterId);
+public sealed record AssociateDisasterReportRequest(long ExpectedVersion);
+public sealed record UpdateDisasterOrganizationsRequest(long ExpectedVersion, string? RegisteringOrganizationId,
+    string? EmergencyResponsibleId, DisasterOrganization[]? Organizations);
+public sealed record UpdateDisasterGeographyRequest(long ExpectedVersion, DisasterGeography? Geography, string? SourceId = null);

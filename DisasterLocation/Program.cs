@@ -49,6 +49,11 @@ builder.Services.AddAuthorization(options => options.AddPolicy("DisasterAdminist
     policy.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id").RequireAssertion(context => context.User.IsInRole("disasters.admin")
         || (localDemo && context.User.HasClaim("local_demo", "true")))));
 
+builder.Services.AddAuthorization(options => options.AddPolicy("DisasterIntegration", policy =>
+    policy.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id").RequireAssertion(context =>
+        context.User.IsInRole("disasters.integration") || context.User.IsInRole("disasters.admin")
+        || (localDemo && context.User.HasClaim("local_demo", "true")))));
+
 var app = builder.Build();
 app.UseRouting();
 app.UseRateLimiter();
@@ -209,5 +214,67 @@ types.MapPost("/", async (CreateDisasterTypeRequest request, DisasterService ser
 types.MapPut("/{id:int}/desactivar", async (int id, DisasterService service, CancellationToken ct) =>
     await service.DeactivateTypeAsync(id, ct) ? Results.NoContent() : Results.NotFound())
     .RequireAuthorization("DisasterAdministration");
+var reports = app.MapGroup("/api/reportes-desastre").RequireAuthorization("DisasterIntegration");
+reports.MapGet("/", async (DisasterService service, CancellationToken ct) => Results.Ok(await service.GetReportsAsync(null, ct)));
+reports.MapGet("/{reportId:guid}", async (Guid reportId, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+{
+    var report = await service.GetReportAsync(reportId, ct);
+    if (report is null) return Results.NotFound();
+    if (report.DisasterId is int id && !access.CanAccess(id)) return Results.Forbid();
+    return Results.Ok(DisasterService.ReportResponse(report));
+});
+reports.MapPost("/", async (ReceiveDisasterReportRequest request, DisasterService service, HttpContext http, CancellationToken ct) =>
+{
+    try
+    {
+        var result = await service.ReceiveReportAsync(request, PlatformSecurity.Actor(http.User), ct);
+        return result.Created ? Results.Created($"/api/reportes-desastre/{result.Report.Id}", result.Report) : Results.Ok(result.Report);
+    }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+    catch (DisasterConflictException e) { return Results.Conflict(new { detail = e.Message }); }
+});
+disasters.MapGet("/{id:int}/reportes", async (int id, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+    !access.CanAccess(id) ? Results.Forbid() : Results.Ok(await service.GetReportsAsync(id, ct)))
+    .RequireAuthorization(PlatformSecurity.Read);
+disasters.MapPut("/{id:int}/reportes/{reportId:guid}", async (int id, Guid reportId, AssociateDisasterReportRequest request,
+    DisasterService service, IDisasterAccess access, HttpContext http, CancellationToken ct) =>
+{
+    if (!access.CanAccess(id)) return Results.Forbid();
+    var report = await service.GetReportAsync(reportId, ct);
+    if (report?.DisasterId is int previousId && !access.CanAccess(previousId)) return Results.Forbid();
+    try
+    {
+        var result = await service.AssociateReportAsync(id, reportId, request.ExpectedVersion, PlatformSecurity.Actor(http.User), ct);
+        return result is null ? Results.NotFound() : Results.Ok(result);
+    }
+    catch (DisasterConflictException) { return Results.Conflict(new { detail = "El reporte ya está asociado o la versión cambió." }); }
+}).RequireAuthorization(PlatformSecurity.Write);
+disasters.MapPut("/{id:int}/organismos", async (int id, UpdateDisasterOrganizationsRequest request,
+    DisasterService service, IDisasterAccess access, HttpContext http, CancellationToken ct) =>
+{
+    if (!access.CanAccess(id)) return Results.Forbid();
+    try
+    {
+        var result = await service.UpdateOrganizationsAsync(id, request, PlatformSecurity.Actor(http.User), ct);
+        return result is null ? Results.NotFound() : Results.Ok(result);
+    }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+    catch (DisasterConflictException) { return Results.Conflict(); }
+}).RequireAuthorization(PlatformSecurity.Write);
+disasters.MapPut("/{id:int}/geografia", async (int id, UpdateDisasterGeographyRequest request,
+    DisasterService service, IDisasterAccess access, HttpContext http, CancellationToken ct) =>
+{
+    if (!access.CanAccess(id)) return Results.Forbid();
+    try
+    {
+        var result = await service.UpdateGeographyAsync(id, request, PlatformSecurity.Actor(http.User), ct);
+        return result is null ? Results.NotFound() : Results.Ok(result);
+    }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+    catch (DisasterConflictException) { return Results.Conflict(); }
+}).RequireAuthorization(PlatformSecurity.Write);
+disasters.MapGet("/{id:int}/alertas", async (int id, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+    !access.CanAccess(id) ? Results.Forbid() : Results.Ok(await service.GetAlertsAsync(id, ct)))
+    .RequireAuthorization(PlatformSecurity.Read);
 app.Run();
 public partial class Program { }

@@ -211,6 +211,8 @@ public sealed class DisasterApiTests : IDisposable
         var state = await updated.Content.ReadFromJsonAsync<JsonElement>();
         Assert.Equal(2, state.GetProperty("version").GetInt64()); Assert.Equal("Registered", state.GetProperty("phase").GetString());
         Assert.Equal(receipt.GetProperty("registeredAt").GetString(), state.GetProperty("registeredAt").GetString());
+        var emitted = await client.GetFromJsonAsync<JsonElement>(path + "/alertas");
+        Assert.Equal(new[] { "DisasterAreaChanged", "DisasterAttentionChanged" }, emitted.EnumerateArray().Select(x => x.GetProperty("eventType").GetString()).OrderBy(x => x));
         Assert.Equal(HttpStatusCode.Conflict, (await client.PutAsJsonAsync(path, update)).StatusCode);
         var repeated = await retry.PostAsJsonAsync("/api/desastres", original); Assert.Equal(HttpStatusCode.OK, repeated.StatusCode);
         Assert.Equal(receipt.ToString(), (await repeated.Content.ReadFromJsonAsync<JsonElement>()).ToString());
@@ -436,6 +438,181 @@ public sealed class DisasterApiTests : IDisposable
         await pending.CommitAsync(); await waiting.WaitAsync(TimeSpan.FromSeconds(5)); await following.CommitAsync();
         var final = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(after!));
         Assert.Equal(new[] { "Sin confirmar", "Espera revisión" }, final.GetProperty("items").EnumerateArray().Select(x => x.GetProperty("nombre").GetString()));
+    }
+
+    [Fact]
+    public async Task IntegrationMigrationPreservesHistoricalSnapshotsSequencesAndUnknownReferences()
+    {
+        var options = new DbContextOptionsBuilder<DisasterDbContext>().UseNpgsql(_connection,
+            p => p.MigrationsHistoryTable(PlatformDatabase.DisasterHistory, PlatformDatabase.DisasterSchema)).Options;
+        await using (var prior = new DisasterDbContext(options))
+        {
+            await prior.GetService<IMigrator>().MigrateAsync("20261118030455_AddDisasterSyncSequence");
+            await prior.Database.ExecuteSqlRawAsync("INSERT INTO disasters.\"Desastres\" (\"Nombre\",\"Ubicacion\",\"Descripcion\",\"Severidad\",\"Latitud\",\"Longitud\",\"CreationSnapshot\") VALUES ('Historic','Local','Original',1,0,0,'{{\"Nombre\":\"Historic\",\"Radio\":null}}')");
+        }
+        long revision;
+        await using (var connection = new NpgsqlConnection(_connection)) {
+            await connection.OpenAsync(); await using var command = new NpgsqlCommand("SELECT \"SyncSequence\" FROM disasters.\"Desastres\"", connection);
+            revision = (long)(await command.ExecuteScalarAsync())!;
+        }
+        await PlatformDatabase.MigrateAsync(_connection);
+        await using var db = new DisasterDbContext(options);
+        var row = await db.Disasters.SingleAsync();
+        Assert.Equal("Historic", row.Nombre); Assert.Null(row.GeographyJson); Assert.Null(row.RegisteringOrganizationId);
+        Assert.Null(row.EmergencyResponsibleId); Assert.Null(row.OrganizationsJson);
+        Assert.Contains("Historic", row.CreationSnapshot); Assert.Equal(1, row.Version);
+        Assert.Equal(revision, await db.Disasters.Select(x => EF.Property<long>(x, "SyncSequence")).SingleAsync());
+        Assert.Empty(await db.Reports.ToListAsync()); Assert.Empty(await db.Outbox.ToListAsync());
+    }
+
+    [Fact]
+    public async Task NewIntegrationAndResponsibilityOperationsNeverExpandAnonymousAccess()
+    {
+        await using var app = App(); using var client = app.CreateClient();
+        var created = await client.PostAsJsonAsync("/api/desastres", new { nombre = "Público histórico", ubicacion = "Local", severidad = 2,
+            descripcion = "Contrato compatible", latitud = 4.7, longitud = -74.0,
+            registeringOrganizationId = "forged", emergencyResponsibleId = "forged", organizations = new[] { new { organizationId = "forged" } } });
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        var row = await created.Content.ReadFromJsonAsync<JsonElement>(); var id = row.GetProperty("id").GetInt32();
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("registeringOrganizationId").ValueKind);
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("emergencyResponsibleId").ValueKind);
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("organizations").ValueKind);
+        foreach (var path in new[] { $"/api/desastres/{id}/reportes", $"/api/desastres/{id}/alertas", "/api/reportes-desastre" })
+            Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync(path)).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PutAsJsonAsync($"/api/desastres/{id}/organismos", new { expectedVersion = 1, organizations = Array.Empty<object>() })).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PutAsJsonAsync($"/api/desastres/{id}/geografia", Geography(1))).StatusCode);
+    }
+
+    private static object Incoming(string sourceReportId, bool preliminary = true, object? content = null) => new {
+        sourceKind = "External", sourceId = "authorized-provider", sourceReportId,
+        content = content ?? new { measurement = 4.5, original = "Contenido sin modificar" },
+        createPreliminary = preliminary,
+        disaster = preliminary ? new { nombre = "Detección", ubicacion = "Bogotá", severidad = 3,
+            descripcion = "Fuente canónica", latitud = 4.7, longitud = -74.0, radio = (double?)null } : null,
+        registeringOrganizationId = "eden:organization:25"
+    };
+
+    [Fact]
+    public async Task ExternalReportsAreAuthorizedIdempotentAndDetectedAtomically()
+    {
+        await using var app = App(); await using var peer = App(); using var client = app.CreateClient(); using var second = peer.CreateClient();
+        var request = Incoming("measurement-1");
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsJsonAsync("/api/reportes-desastre", request)).StatusCode);
+        Authenticate(client, 1);
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync("/api/reportes-desastre", request)).StatusCode);
+        Authenticate(client, 1, "disasters.integration"); Authenticate(second, 1, "disasters.integration");
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.PostAsJsonAsync("/api/reportes-desastre", new { sourceId = "no-kind", sourceReportId = "missing-kind", content = new { value = 1 } })).StatusCode);
+        var results = await Task.WhenAll(client.PostAsJsonAsync("/api/reportes-desastre", request), second.PostAsJsonAsync("/api/reportes-desastre", request));
+        Assert.Equal(new[] { HttpStatusCode.OK, HttpStatusCode.Created }, results.Select(x => x.StatusCode).OrderBy(x => x));
+        var first = await results[0].Content.ReadFromJsonAsync<JsonElement>(); var receipt = await results[1].Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(first.GetProperty("id").GetString(), receipt.GetProperty("id").GetString());
+        var id = first.GetProperty("disasterId").GetInt32();
+        var disaster = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}");
+        Assert.Equal("Detected", disaster.GetProperty("phase").GetString());
+        Assert.Equal("eden:organization:25", disaster.GetProperty("registeringOrganizationId").GetString());
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync("/api/reportes-desastre", Incoming("measurement-1", content: new { measurement = 8 }))).StatusCode);
+        using var scope = app.Services.CreateScope(); var db = scope.ServiceProvider.GetRequiredService<DisasterDbContext>();
+        Assert.Equal(1, await db.Disasters.CountAsync()); Assert.Equal(1, await db.Reports.CountAsync());
+        Assert.Equal(1, await db.Outbox.CountAsync()); Assert.Equal(1, await db.PhaseAudit.CountAsync());
+        Assert.Equal("DisasterDetected", (await db.Outbox.SingleAsync()).EventType);
+        Assert.Contains("measurement", (await db.Reports.SingleAsync()).OriginalContent);
+    }
+
+    [Fact]
+    public async Task ConsolidationPreservesOriginalReportsAndAdvancesTheDeltaCursor()
+    {
+        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client);
+        Authenticate(client, id, "disasters.integration");
+        var reportResponse = await client.PostAsJsonAsync("/api/reportes-desastre", Incoming("pending-1", false));
+        var report = await reportResponse.Content.ReadFromJsonAsync<JsonElement>(); var reportId = report.GetProperty("id").GetGuid();
+        var initial = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync");
+        Authenticate(client, id + 1);
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PutAsJsonAsync($"/api/desastres/{id}/reportes/{reportId}", new { expectedVersion = 1 })).StatusCode);
+        Authenticate(client, id);
+        Assert.Equal(HttpStatusCode.OK, (await client.PutAsJsonAsync($"/api/desastres/{id}/reportes/{reportId}", new { expectedVersion = 1 })).StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PutAsJsonAsync($"/api/desastres/{id}/reportes/{reportId}", new { expectedVersion = 2 })).StatusCode);
+        var reports = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}/reportes");
+        Assert.Equal(report.GetProperty("content").ToString(), reports[0].GetProperty("content").ToString());
+        var delta = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(initial.GetProperty("nextCursor").GetString()!));
+        Assert.Single(delta.GetProperty("items").EnumerateArray()); Assert.Equal(2, delta.GetProperty("items")[0].GetProperty("version").GetInt64());
+        var history = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}/historial");
+        Assert.Contains(reportId.ToString(), history[0].GetProperty("changes").GetString());
+        Authenticate(client, id, "disasters.integration");
+        var internalResponse = await client.PostAsJsonAsync("/api/reportes-desastre", new {
+            sourceKind = "Internal", sourceId = "operator-console", sourceReportId = "internal-25",
+            content = new { observation = "Segundo reporte original" } });
+        var internalReport = await internalResponse.Content.ReadFromJsonAsync<JsonElement>();
+        Authenticate(client, id);
+        Assert.Equal(HttpStatusCode.OK, (await client.PutAsJsonAsync($"/api/desastres/{id}/reportes/{internalReport.GetProperty("id").GetGuid()}", new { expectedVersion = 2 })).StatusCode);
+        var all = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}/reportes");
+        Assert.Equal(2, all.GetArrayLength());
+        Assert.Contains(all.EnumerateArray(), x => x.GetProperty("id").GetGuid() == reportId && JsonElement.DeepEquals(x.GetProperty("content"), report.GetProperty("content")));
+        Assert.Equal(3, (await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}")).GetProperty("version").GetInt64());
+    }
+
+    private static object Geography(long version, object? polygon = null) => new {
+        expectedVersion = version, sourceId = "gis-source:authorized",
+        geography = new { polygon, municipalities = new[] { "Bogotá" }, neighborhoods = new[] { "Centro" }, riskZones = new[] { "Ribera" } }
+    };
+    private static object Polygon(params double[][] points) => new { type = "Polygon", coordinates = new[] { points } };
+
+    [Fact]
+    public async Task OrganizationsAndGeographyAreVersionedAuditedAndIncludedInDeltaSync()
+    {
+        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client); Authenticate(client, id);
+        var organizations = new { expectedVersion = 1, registeringOrganizationId = "eden:registrar:1", emergencyResponsibleId = "responsible:4",
+            organizations = new[] { new { organizationId = "eden:12", responsibility = "Rescate" }, new { organizationId = "eden:12", responsibility = "Evacuación" } } };
+        Assert.Equal(HttpStatusCode.OK, (await client.PutAsJsonAsync($"/api/desastres/{id}/organismos", organizations)).StatusCode);
+        var cursor = (await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync")).GetProperty("nextCursor").GetString();
+        var polygon = Polygon([-74.1,4.6],[-74.0,4.6],[-74.0,4.7],[-74.1,4.6]);
+        Assert.Equal(HttpStatusCode.OK, (await client.PutAsJsonAsync($"/api/desastres/{id}/geografia", Geography(2, polygon))).StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PutAsJsonAsync($"/api/desastres/{id}/geografia", Geography(2))).StatusCode);
+        var changes = await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(cursor!));
+        var current = changes.GetProperty("items")[0]; Assert.Equal(3, current.GetProperty("version").GetInt64());
+        Assert.Equal("Polygon", current.GetProperty("geography").GetProperty("polygon").GetProperty("type").GetString());
+        Assert.Equal(2, current.GetProperty("organizations").GetArrayLength());
+        Assert.Equal(HttpStatusCode.OK, (await client.PutAsJsonAsync($"/api/desastres/{id}/geografia", Geography(3))).StatusCode);
+        var history = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}/historial");
+        Assert.Equal(3, history.GetArrayLength()); Assert.Contains("Polygon", history[2].GetProperty("changes").GetString());
+        Assert.Equal("gis-source:authorized", history[2].GetProperty("reason").GetString());
+        Assert.All(history.EnumerateArray(), x => Assert.Equal("authenticated-operator", x.GetProperty("actor").GetString()));
+        var alerts = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}/alertas"); Assert.Equal(2, alerts.GetArrayLength());
+    }
+
+    [Fact]
+    public async Task InvalidGeometriesAreRejectedWithoutChangingVersionOrAudit()
+    {
+        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client); Authenticate(client, id);
+        foreach (var polygon in new object[] {
+            Polygon([0,0],[1,1],[0,1],[1,0],[0,0]), Polygon([0,0],[1,1],[2,2],[0,0]),
+            Polygon([0,0],[1,0],[1,1]), Polygon([0,0],[181,0],[1,1],[0,0]),
+            new { type = "Polygon", coordinates = new double[][][] { [[0,0],[2,0],[2,2],[0,2],[0,0]], [[3,3],[4,3],[4,4],[3,3]] } } })
+            Assert.Equal(HttpStatusCode.BadRequest, (await client.PutAsJsonAsync($"/api/desastres/{id}/geografia", Geography(1, polygon))).StatusCode);
+        var current = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}"); Assert.Equal(1, current.GetProperty("version").GetInt64());
+        Assert.Empty((await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}/historial")).EnumerateArray());
+    }
+
+    [Fact]
+    public async Task FailedOutboxInsertRollsBackBusinessAuditAndDeltaAndHistoricalCreationStillReplays()
+    {
+        await using var app = App(); using var client = app.CreateClient();
+        var key = Guid.NewGuid().ToString(); client.DefaultRequestHeaders.Add("Idempotency-Key", key);
+        var body = new { nombre = "Original", ubicacion = "Bogotá", severidad = 3, descripcion = "Histórico", latitud = 4.7, longitud = -74.0 };
+        var created = await client.PostAsJsonAsync("/api/desastres", body); var receipt = await created.Content.ReadFromJsonAsync<JsonElement>();
+        var id = receipt.GetProperty("id").GetInt32(); Authenticate(client, id);
+        using var scope = app.Services.CreateScope(); var db = scope.ServiceProvider.GetRequiredService<DisasterDbContext>();
+        await db.Database.ExecuteSqlRawAsync("ALTER TABLE disasters.\"DisasterOutboxMessages\" ADD CONSTRAINT \"RejectEvent\" CHECK (\"EventType\" <> 'DisasterAreaChanged')");
+        var cursor = (await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync")).GetProperty("nextCursor").GetString();
+        Assert.Equal(HttpStatusCode.InternalServerError, (await client.PutAsJsonAsync($"/api/desastres/{id}/geografia", Geography(1))).StatusCode);
+        Assert.Empty((await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?cursor=" + Uri.EscapeDataString(cursor!))).GetProperty("items").EnumerateArray());
+        Assert.Equal(0, await db.PhaseAudit.CountAsync()); Assert.Equal(0, await db.Outbox.CountAsync());
+        await db.Database.ExecuteSqlRawAsync("ALTER TABLE disasters.\"DisasterOutboxMessages\" DROP CONSTRAINT \"RejectEvent\"");
+        Assert.Equal(HttpStatusCode.OK, (await client.PutAsJsonAsync($"/api/desastres/{id}/geografia", Geography(1))).StatusCode);
+        var replay = await client.PostAsJsonAsync("/api/desastres", body); Assert.Equal(HttpStatusCode.OK, replay.StatusCode);
+        var replayed = await replay.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(receipt.GetProperty("nombre").GetString(), replayed.GetProperty("nombre").GetString());
+        Assert.Equal(JsonValueKind.Null, replayed.GetProperty("geography").ValueKind);
+        Assert.NotEqual(1, (await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}")).GetProperty("version").GetInt64());
     }
 
     public void Dispose()
