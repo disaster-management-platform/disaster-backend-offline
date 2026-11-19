@@ -46,3 +46,5 @@ public sealed record AssociateDisasterReportRequest(long ExpectedVersion);
 public sealed record UpdateDisasterOrganizationsRequest(long ExpectedVersion, string? RegisteringOrganizationId,
     string? EmergencyResponsibleId, DisasterOrganization[]? Organizations);
 public sealed record UpdateDisasterGeographyRequest(long ExpectedVersion, DisasterGeography? Geography, string? SourceId = null);
+
+public sealed record RegisterDisasterReportRequest(CreateDisasterRequest Report, long ExpectedVersion);

@@ -46,7 +46,9 @@ public sealed partial class DisasterService
         if (existing is null && preliminary?.DisasterTypeId is int typeId
             && !(await repository.GetTypesAsync(ct)).Any(x => x.Id == typeId && x.IsActive))
             throw new DisasterValidationException(new Dictionary<string, string[]> { ["disasterTypeId"] = ["El tipo no existe o está desactivado."] });
-        var result = existing is null ? await repository.ReceiveReportAsync(report, preliminary, ct) : new DisasterReportReceipt(existing, false);
+        DisasterReportReceipt result;
+        try { result = existing is null ? await repository.ReceiveReportAsync(report, preliminary, ct) : new DisasterReportReceipt(existing, false); }
+        catch (System.Data.DBConcurrencyException) { throw new DisasterConflictException(); }
         if (!JsonElement.DeepEquals(JsonSerializer.Deserialize<JsonElement>(report.ReceiptSnapshot),
                 JsonSerializer.Deserialize<JsonElement>(result.Report.ReceiptSnapshot))) throw new DisasterConflictException();
         return (ReportResponse(result.Report), result.Created);
@@ -62,11 +64,77 @@ public sealed partial class DisasterService
     public Task<DisasterReport?> GetReportAsync(Guid id, CancellationToken ct) => repository.GetReportAsync(id, ct);
     public Task<IReadOnlyList<DisasterAlert>> GetAlertsAsync(int id, CancellationToken ct) => repository.GetAlertsAsync(id, ct);
 
+    private static string CityKey(string location)
+    {
+        var city = location.Split(',')[0].Replace("D.C.", "", StringComparison.OrdinalIgnoreCase);
+        var characters = city.Normalize(System.Text.NormalizationForm.FormD)
+            .Where(c => System.Globalization.CharUnicodeInfo.GetUnicodeCategory(c) != System.Globalization.UnicodeCategory.NonSpacingMark)
+            .Select(c => char.IsLetterOrDigit(c) ? char.ToUpperInvariant(c) : ' ').ToArray();
+        return string.Join(' ', new string(characters).Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private static bool Similar(Disaster disaster, int typeId, string location, DateTimeOffset startedAt) =>
+        disaster.DisasterTypeId == typeId && disaster.StartedAt is DateTimeOffset existing
+        && (existing - startedAt).Duration() <= TimeSpan.FromHours(72)
+        && CityKey(disaster.Ubicacion) == CityKey(location);
+
+    public async Task<IReadOnlyList<DisasterResponse>> FindSimilarAsync(int typeId, string location,
+        DateTimeOffset startedAt, CancellationToken ct)
+    {
+        var errors = new Dictionary<string, string[]>();
+        ValidateText("ubicacion", location, 200, errors);
+        if (typeId <= 0) errors["disasterTypeId"] = ["Seleccione un tipo válido."];
+        if (errors.Count != 0) throw new DisasterValidationException(errors);
+        return (await repository.GetAllAsync(ct)).Where(d => Similar(d, typeId, location, startedAt))
+            .OrderBy(d => (d.StartedAt!.Value - startedAt).Duration()).Select(ToResponse).ToArray();
+    }
+
+    public async Task<DisasterResponse?> RegisterReportAsync(int id, CreateDisasterRequest request,
+        long expectedVersion, string key, string actor, string organization, CancellationToken ct)
+    {
+        if (!Guid.TryParse(key, out var identity) || identity == Guid.Empty)
+            throw new DisasterValidationException(new Dictionary<string, string[]> { ["Idempotency-Key"] = ["Use un UUID estable."] });
+        var normalized = Normalize(request, identity.ToString());
+        var current = await repository.GetByIdAsync(id, ct);
+        if (current is null) return null;
+        const string source = "manual-web";
+        var previous = await repository.GetReportBySourceAsync(source, identity.ToString(), ct);
+        if (previous is not null && previous.ReceivedBy != actor) throw new DisasterConflictException();
+        if (await repository.GetByClientRequestIdAsync(identity, ct) is not null) throw new DisasterConflictException();
+        if (previous is null)
+        {
+            if (current.Version != expectedVersion) throw new DisasterConflictException();
+            if (normalized.DisasterTypeId is not int typeId || normalized.StartedAt is not DateTimeOffset date
+                || !Similar(current, typeId, normalized.Ubicacion, date))
+                throw new DisasterValidationException(new Dictionary<string, string[]> { ["disasterId"] =
+                    ["La asociación requiere el mismo tipo y municipio o ciudad, dentro de 72 horas."] });
+        }
+        var result = await ReceiveReportAsync(new ReceiveDisasterReportRequest(InformationSourceKind.Internal, source,
+            identity.ToString(), JsonSerializer.SerializeToElement(request, new JsonSerializerOptions(JsonSerializerDefaults.Web)),
+            RegisteringOrganizationId: organization), actor, ct);
+        if (result.Report.DisasterId == id) return await GetByIdAsync(id, ct);
+        try { return await AssociateReportAsync(id, result.Report.Id, expectedVersion, actor, ct); }
+        catch (DisasterConflictException)
+        {
+            if ((await repository.GetReportAsync(result.Report.Id, ct))?.DisasterId == id) return await GetByIdAsync(id, ct);
+            throw;
+        }
+    }
+
     public async Task<DisasterResponse?> AssociateReportAsync(int id, Guid reportId, long expectedVersion, string actor, CancellationToken ct)
     {
         if (await repository.GetByIdAsync(id, ct) is null) return null;
-        if (await repository.GetReportAsync(reportId, ct) is null) return null;
-        if (!await repository.AssociateReportAsync(id, reportId, expectedVersion, actor, ct)) throw new DisasterConflictException();
+        var report = await repository.GetReportAsync(reportId, ct);
+        if (report is null) return null;
+        if (report.DisasterId is not null) throw new DisasterConflictException();
+        try
+        {
+            if (!await repository.AssociateReportAsync(id, reportId, expectedVersion, actor, ct)) throw new DisasterConflictException();
+        }
+        catch (ArgumentOutOfRangeException e)
+        {
+            throw new DisasterValidationException(new Dictionary<string, string[]> { ["geography"] = [e.Message] });
+        }
         return await GetByIdAsync(id, ct);
     }
 

@@ -83,6 +83,77 @@ public sealed class DisasterApiTests : IDisposable
     }
 
     [Fact]
+    public async Task ManualReportsSuggestWithoutMergingAndPersistAreaAtomically()
+    {
+        await using var app = App(); using var client = app.CreateClient();
+        var types = (await client.GetFromJsonAsync<JsonElement>("/api/tipos-desastre")).EnumerateArray().ToArray();
+        var type = types[0].GetProperty("id").GetInt32();
+        var at = DateTimeOffset.Parse("2026-11-19T12:00:00Z");
+        object Body(double lat, double lng, string description = "Reporte manual") => new {
+            nombre = "Evento de prueba", ubicacion = "Neiva, Huila", severidad = 3, descripcion = description,
+            latitud = lat, longitud = lng, disasterTypeId = type, startedAt = at };
+        var creation = Guid.NewGuid().ToString(); client.DefaultRequestHeaders.Add("Idempotency-Key", creation);
+        var initial = await client.PostAsJsonAsync("/api/desastres", Body(2.9, -75.2));
+        Assert.Equal(HttpStatusCode.Created, initial.StatusCode);
+        var id = (await initial.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetInt32();
+        var query = $"/api/desastres/coincidencias?disasterTypeId={type}&ubicacion=NEIVA%2C%20Huila&startedAt=";
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync(query+Uri.EscapeDataString(at.ToString("O")))).StatusCode);
+        Authenticate(client, id);
+        var matches = await client.GetFromJsonAsync<JsonElement>(query+Uri.EscapeDataString(at.AddHours(72).ToString("O")));
+        Assert.Single(matches.EnumerateArray());
+        Assert.Empty((await client.GetFromJsonAsync<JsonElement>(query+Uri.EscapeDataString(at.AddHours(72).AddSeconds(1).ToString("O")))).EnumerateArray());
+        Authenticate(client, id+1);
+        Assert.Empty((await client.GetFromJsonAsync<JsonElement>(query+Uri.EscapeDataString(at.ToString("O")))).EnumerateArray());
+        var path = $"/api/desastres/{id}/reportes";
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync(path,new {report=Body(2.91,-75.2),expectedVersion=1})).StatusCode);
+        Authenticate(client,id,"reconstruction.read");
+        Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync(path,new {report=Body(2.91,-75.2),expectedVersion=1})).StatusCode);
+        Authenticate(client,id);
+        client.DefaultRequestHeaders.Remove("Idempotency-Key");client.DefaultRequestHeaders.Add("Idempotency-Key",Guid.NewGuid().ToString());
+        Assert.Equal(HttpStatusCode.Conflict, (await client.PostAsJsonAsync(path,new {report=Body(2.91,-75.2),expectedVersion=99})).StatusCode);
+        var second = await client.PostAsJsonAsync(path,new {report=Body(2.91,-75.2),expectedVersion=1});
+        Assert.Equal(HttpStatusCode.OK,second.StatusCode);
+        var data = await second.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.InRange(data.GetProperty("radio").GetDouble(),1111,1113);
+        Assert.Equal(2.9,data.GetProperty("latitud").GetDouble());
+        Assert.Equal(2,data.GetProperty("version").GetInt64());
+        Assert.Equal(HttpStatusCode.OK,(await client.PostAsJsonAsync(path,new {report=Body(2.91,-75.2),expectedVersion=1})).StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict,(await client.PostAsJsonAsync(path,new {report=Body(2.91,-75.2,"Otro contenido"),expectedVersion=2})).StatusCode);
+        client.DefaultRequestHeaders.Remove("Idempotency-Key");client.DefaultRequestHeaders.Add("Idempotency-Key",Guid.NewGuid().ToString());
+        var attempts = await Task.WhenAll(Enumerable.Range(0,2).Select(_=>client.PostAsJsonAsync(path,new {report=Body(2.9,-75.19),expectedVersion=2})));
+        Assert.All(attempts,r=>Assert.Equal(HttpStatusCode.OK,r.StatusCode));
+        data = await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}");
+        Assert.Equal(3,data.GetProperty("version").GetInt64());
+        Assert.Equal("Polygon",data.GetProperty("geography").GetProperty("polygon").GetProperty("type").GetString());
+        using var scope = app.Services.CreateScope();var db=scope.ServiceProvider.GetRequiredService<DisasterDbContext>();
+        Assert.Equal(2,await db.Reports.CountAsync());Assert.Equal(2,await db.PhaseAudit.CountAsync());
+        Assert.Equal(2,await db.Outbox.CountAsync());Assert.Equal(1,await db.Disasters.CountAsync());
+        Assert.All(await db.PhaseAudit.ToListAsync(),a=>Assert.Contains("Radio",a.Changes));
+        client.DefaultRequestHeaders.Remove("Idempotency-Key");client.DefaultRequestHeaders.Add("Idempotency-Key",creation);
+        var replay=await client.PostAsJsonAsync("/api/desastres",Body(2.9,-75.2));
+        Assert.Equal(HttpStatusCode.OK,replay.StatusCode);
+        Assert.Equal(JsonValueKind.Null,(await replay.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("radio").ValueKind);
+        client.DefaultRequestHeaders.Remove("Idempotency-Key");client.DefaultRequestHeaders.Add("Idempotency-Key",Guid.NewGuid().ToString());
+        await db.Database.ExecuteSqlRawAsync("ALTER TABLE disasters.\"DisasterPhaseAudit\" ADD CONSTRAINT \"RejectReportArea\" CHECK (false) NOT VALID");
+        Assert.Equal(HttpStatusCode.InternalServerError,(await client.PostAsJsonAsync(path,new {report=Body(2.905,-75.19),expectedVersion=3})).StatusCode);
+        Assert.Equal(3,(await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}")).GetProperty("version").GetInt64());
+        Assert.Equal(2,await db.Reports.CountAsync(r=>r.DisasterId==id));
+        await db.Database.ExecuteSqlRawAsync("ALTER TABLE disasters.\"DisasterPhaseAudit\" DROP CONSTRAINT \"RejectReportArea\"");
+        Assert.Equal(HttpStatusCode.OK,(await client.PostAsJsonAsync(path,new {report=Body(2.905,-75.19),expectedVersion=3})).StatusCode);
+        Assert.Equal(3,await db.Reports.CountAsync(r=>r.DisasterId==id));
+        var delta=await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?limit=10");
+        Assert.Equal(4,delta.GetProperty("items")[0].GetProperty("version").GetInt64());
+        var crossMode = Guid.NewGuid();
+        client.DefaultRequestHeaders.Remove("Idempotency-Key"); client.DefaultRequestHeaders.Add("Idempotency-Key",crossMode.ToString());
+        var competing = await Task.WhenAll(client.PostAsJsonAsync("/api/desastres",Body(2.907,-75.197)),
+            client.PostAsJsonAsync(path,new {report=Body(2.907,-75.197),expectedVersion=4}));
+        Assert.Single(competing,r=>r.StatusCode==HttpStatusCode.Conflict);
+        Assert.Single(competing,r=>r.IsSuccessStatusCode);
+        Assert.Equal(1,await db.Disasters.CountAsync(d=>d.ClientRequestId==crossMode)
+            +await db.Reports.CountAsync(r=>r.SourceId=="manual-web" && r.SourceReportId==crossMode.ToString()));
+    }
+
+    [Fact]
     public async Task PhaseChangesRequireIdentityRoleAndDisasterAccess()
     {
         await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client);

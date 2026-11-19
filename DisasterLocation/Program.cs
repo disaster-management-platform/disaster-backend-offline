@@ -229,6 +229,27 @@ types.MapPost("/", async (CreateDisasterTypeRequest request, DisasterService ser
 types.MapPut("/{id:int}/desactivar", async (int id, DisasterService service, CancellationToken ct) =>
     await service.DeactivateTypeAsync(id, ct) ? Results.NoContent() : Results.NotFound())
     .RequireAuthorization("DisasterAdministration");
+disasters.MapGet("/coincidencias", async (int disasterTypeId, string ubicacion, DateTimeOffset startedAt,
+    DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+{
+    try { return Results.Ok((await service.FindSimilarAsync(disasterTypeId, ubicacion, startedAt, ct)).Where(d => access.CanAccess(d.Id))); }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+}).RequireAuthorization(PlatformSecurity.Read);
+disasters.MapPost("/{id:int}/reportes", async (int id, RegisterDisasterReportRequest request,
+    DisasterService service, IDisasterAccess access, HttpContext http, CancellationToken ct) =>
+{
+    if (!access.CanAccess(id)) return Results.Forbid();
+    if (request.Report is null) return Results.BadRequest();
+    try
+    {
+        var result = await service.RegisterReportAsync(id, request.Report, request.ExpectedVersion,
+            http.Request.Headers["Idempotency-Key"].ToString(), PlatformSecurity.Actor(http.User),
+            http.User.FindFirst("organization_id")!.Value, ct);
+        return result is null ? Results.NotFound() : Results.Ok(result);
+    }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
+    catch (DisasterConflictException) { return Results.Conflict(new { detail = "La operación o la versión cambió; conserva el UUID y revisa el desastre." }); }
+}).RequireAuthorization(PlatformSecurity.Write);
 var reports = app.MapGroup("/api/reportes-desastre").RequireAuthorization("DisasterIntegration");
 reports.MapGet("/", async (DisasterService service, CancellationToken ct) => Results.Ok(await service.GetReportsAsync(null, ct)));
 reports.MapGet("/{reportId:guid}", async (Guid reportId, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
@@ -262,6 +283,7 @@ disasters.MapPut("/{id:int}/reportes/{reportId:guid}", async (int id, Guid repor
         var result = await service.AssociateReportAsync(id, reportId, request.ExpectedVersion, PlatformSecurity.Actor(http.User), ct);
         return result is null ? Results.NotFound() : Results.Ok(result);
     }
+    catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException) { return Results.Conflict(new { detail = "El reporte ya está asociado o la versión cambió." }); }
 }).RequireAuthorization(PlatformSecurity.Write);
 disasters.MapPut("/{id:int}/organismos", async (int id, UpdateDisasterOrganizationsRequest request,

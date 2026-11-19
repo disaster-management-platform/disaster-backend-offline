@@ -8,6 +8,6 @@
     
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="DisasterPlatform.Core" Version="4.0.0" />
+    <PackageReference Include="DisasterPlatform.Core" Version="4.1.0" />
   </ItemGroup>
 </Project>

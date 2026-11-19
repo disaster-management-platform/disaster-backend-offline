@@ -131,9 +131,13 @@ public sealed partial class DisasterService(IDisasterRepository repository)
         if (existing is not null)
             return ResolveResult(disaster, new DisasterSaveResult(existing, Created: false));
 
+        if (await repository.GetReportBySourceAsync("manual-web", clientRequestId.ToString(), ct) is not null)
+            throw new DisasterConflictException();
+
         if (disaster.DisasterTypeId is int typeId && !(await repository.GetTypesAsync(ct)).Any(x => x.Id == typeId && x.IsActive))
             throw new DisasterValidationException(new Dictionary<string, string[]> { ["disasterTypeId"] = ["El tipo no existe o está desactivado."] });
-        return ResolveResult(disaster, await repository.AddAsync(disaster, ct));
+        try { return ResolveResult(disaster, await repository.AddAsync(disaster, ct)); }
+        catch (System.Data.DBConcurrencyException) { throw new DisasterConflictException(); }
     }
 
     public async Task<DisasterResponse?> UpdateAsync(int id, UpdateDisasterRequest request, string actor, CancellationToken ct)
