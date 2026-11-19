@@ -101,22 +101,23 @@ public sealed partial class DisasterService
         var previous = await repository.GetReportBySourceAsync(source, identity.ToString(), ct);
         if (previous is not null && previous.ReceivedBy != actor) throw new DisasterConflictException();
         if (await repository.GetByClientRequestIdAsync(identity, ct) is not null) throw new DisasterConflictException();
-        if (previous is null)
-        {
-            if (current.Version != expectedVersion) throw new DisasterConflictException();
-            if (normalized.DisasterTypeId is not int typeId || normalized.StartedAt is not DateTimeOffset date
-                || !Similar(current, typeId, normalized.Ubicacion, date))
-                throw new DisasterValidationException(new Dictionary<string, string[]> { ["disasterId"] =
-                    ["La asociación requiere el mismo tipo y municipio o ciudad, dentro de 72 horas."] });
-        }
-        var result = await ReceiveReportAsync(new ReceiveDisasterReportRequest(InformationSourceKind.Internal, source,
+        var command = new ReceiveDisasterReportRequest(InformationSourceKind.Internal, source,
             identity.ToString(), JsonSerializer.SerializeToElement(request, new JsonSerializerOptions(JsonSerializerDefaults.Web)),
-            RegisteringOrganizationId: organization), actor, ct);
-        if (result.Report.DisasterId == id) return await GetByIdAsync(id, ct);
-        try { return await AssociateReportAsync(id, result.Report.Id, expectedVersion, actor, ct); }
+            RegisteringOrganizationId: organization);
+        var result = previous is null ? null : (await ReceiveReportAsync(command, actor, ct)).Report;
+        if (result?.DisasterId == id) return await GetByIdAsync(id, ct);
+        if (result?.DisasterId is not null) throw new DisasterConflictException();
+        if (current.Version != expectedVersion) throw new DisasterConflictException();
+        if (normalized.DisasterTypeId is not int typeId || normalized.StartedAt is not DateTimeOffset date
+            || !Similar(current, typeId, normalized.Ubicacion, date))
+            throw new DisasterValidationException(new Dictionary<string, string[]> { ["disasterId"] =
+                ["La asociación requiere el mismo tipo y municipio o ciudad, dentro de 72 horas."] });
+        result ??= (await ReceiveReportAsync(command, actor, ct)).Report;
+        if (result.DisasterId == id) return await GetByIdAsync(id, ct);
+        try { return await AssociateReportAsync(id, result.Id, expectedVersion, actor, ct); }
         catch (DisasterConflictException)
         {
-            if ((await repository.GetReportAsync(result.Report.Id, ct))?.DisasterId == id) return await GetByIdAsync(id, ct);
+            if ((await repository.GetReportAsync(result.Id, ct))?.DisasterId == id) return await GetByIdAsync(id, ct);
             throw;
         }
     }

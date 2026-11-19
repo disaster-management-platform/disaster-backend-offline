@@ -139,14 +139,23 @@ public sealed class DisasterApiTests : IDisposable
         Assert.Equal(3,(await client.GetFromJsonAsync<JsonElement>($"/api/desastres/{id}")).GetProperty("version").GetInt64());
         Assert.Equal(2,await db.Reports.CountAsync(r=>r.DisasterId==id));
         await db.Database.ExecuteSqlRawAsync("ALTER TABLE disasters.\"DisasterPhaseAudit\" DROP CONSTRAINT \"RejectReportArea\"");
-        Assert.Equal(HttpStatusCode.OK,(await client.PostAsJsonAsync(path,new {report=Body(2.905,-75.19),expectedVersion=3})).StatusCode);
+        var edit = JsonSerializer.Deserialize<Dictionary<string,JsonElement>>(data.GetRawText())!;
+        edit["ubicacion"]=JsonSerializer.SerializeToElement("Pitalito, Huila");
+        edit["expectedVersion"]=JsonSerializer.SerializeToElement(3L);
+        Assert.Equal(HttpStatusCode.OK,(await client.PutAsJsonAsync($"/api/desastres/{id}",edit)).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest,(await client.PostAsJsonAsync(path,new {report=Body(2.905,-75.19),expectedVersion=4})).StatusCode);
+        Assert.Equal(2,await db.Reports.CountAsync(r=>r.DisasterId==id));
+        edit["ubicacion"]=JsonSerializer.SerializeToElement("Neiva, Huila");
+        edit["expectedVersion"]=JsonSerializer.SerializeToElement(4L);
+        Assert.Equal(HttpStatusCode.OK,(await client.PutAsJsonAsync($"/api/desastres/{id}",edit)).StatusCode);
+        Assert.Equal(HttpStatusCode.OK,(await client.PostAsJsonAsync(path,new {report=Body(2.905,-75.19),expectedVersion=5})).StatusCode);
         Assert.Equal(3,await db.Reports.CountAsync(r=>r.DisasterId==id));
         var delta=await client.GetFromJsonAsync<JsonElement>("/api/desastres/sync?limit=10");
-        Assert.Equal(4,delta.GetProperty("items")[0].GetProperty("version").GetInt64());
+        Assert.Equal(6,delta.GetProperty("items")[0].GetProperty("version").GetInt64());
         var crossMode = Guid.NewGuid();
         client.DefaultRequestHeaders.Remove("Idempotency-Key"); client.DefaultRequestHeaders.Add("Idempotency-Key",crossMode.ToString());
         var competing = await Task.WhenAll(client.PostAsJsonAsync("/api/desastres",Body(2.907,-75.197)),
-            client.PostAsJsonAsync(path,new {report=Body(2.907,-75.197),expectedVersion=4}));
+            client.PostAsJsonAsync(path,new {report=Body(2.907,-75.197),expectedVersion=6}));
         Assert.Single(competing,r=>r.StatusCode==HttpStatusCode.Conflict);
         Assert.Single(competing,r=>r.IsSuccessStatusCode);
         Assert.Equal(1,await db.Disasters.CountAsync(d=>d.ClientRequestId==crossMode)
