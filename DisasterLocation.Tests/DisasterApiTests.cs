@@ -22,7 +22,7 @@ using Xunit;
 
 namespace DisasterLocation.Tests;
 
-public sealed class DisasterApiTests : IDisposable
+public sealed partial class DisasterApiTests : IDisposable
 {
     private readonly string _admin;
     private readonly string _name = "disaster_test_" + Guid.NewGuid().ToString("N");
@@ -61,10 +61,17 @@ public sealed class DisasterApiTests : IDisposable
         });
     }
 
-    private static void Authenticate(HttpClient client, int id, string role = "reconstruction.write", bool expired = false, bool forgedDemo = false)
+    private static HttpClient Client(WebApplicationFactory<Program> app)
+    {
+        var client = app.CreateClient();
+        Authenticate(client, 0, "disasters.admin", actor: "fixture-creator");
+        return client;
+    }
+
+    private static void Authenticate(HttpClient client, int id, string role = "disasters.write", bool expired = false, bool forgedDemo = false, string actor = "authenticated-operator", string organization = "organization-a")
     {
         var now = DateTime.UtcNow;
-        var claims = new List<Claim> { new("sub", "authenticated-operator"), new("organization_id", "organization-a"),
+        var claims = new List<Claim> { new("sub", actor), new("organization_id", organization),
             new("role", role), new("disaster_id", id.ToString()) };
         if (forgedDemo) claims.Add(new("local_demo", "true"));
         var token = new JwtSecurityToken("https://identity.test", "platform", claims, now.AddHours(-2),
@@ -85,7 +92,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task ManualReportsSuggestWithoutMergingAndPersistAreaAtomically()
     {
-        await using var app = App(); using var client = app.CreateClient();
+        await using var app = App(); using var client = Client(app);
         var types = (await client.GetFromJsonAsync<JsonElement>("/api/tipos-desastre")).EnumerateArray().ToArray();
         var type = types[0].GetProperty("id").GetInt32();
         var at = DateTimeOffset.Parse("2026-11-19T12:00:00Z");
@@ -97,6 +104,7 @@ public sealed class DisasterApiTests : IDisposable
         Assert.Equal(HttpStatusCode.Created, initial.StatusCode);
         var id = (await initial.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("id").GetInt32();
         var query = $"/api/desastres/coincidencias?disasterTypeId={type}&ubicacion=NEIVA%2C%20Huila&startedAt=";
+        client.DefaultRequestHeaders.Authorization = null;
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync(query+Uri.EscapeDataString(at.ToString("O")))).StatusCode);
         Authenticate(client, id);
         var matches = await client.GetFromJsonAsync<JsonElement>(query+Uri.EscapeDataString(at.AddHours(72).ToString("O")));
@@ -106,7 +114,7 @@ public sealed class DisasterApiTests : IDisposable
         Assert.Empty((await client.GetFromJsonAsync<JsonElement>(query+Uri.EscapeDataString(at.ToString("O")))).EnumerateArray());
         var path = $"/api/desastres/{id}/reportes";
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync(path,new {report=Body(2.91,-75.2),expectedVersion=1})).StatusCode);
-        Authenticate(client,id,"reconstruction.read");
+        Authenticate(client,id,"disasters.read");
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync(path,new {report=Body(2.91,-75.2),expectedVersion=1})).StatusCode);
         Authenticate(client,id);
         client.DefaultRequestHeaders.Remove("Idempotency-Key");client.DefaultRequestHeaders.Add("Idempotency-Key",Guid.NewGuid().ToString());
@@ -165,12 +173,13 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task PhaseChangesRequireIdentityRoleAndDisasterAccess()
     {
-        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client);
+        await using var app = App(); using var client = Client(app); var id = await CreateAsync(client);
         var path = $"/api/desastres/{id}/fase"; var body = new { phase = "Response", expectedVersion = 1, reason = "Inicio de atención justificado" };
+        client.DefaultRequestHeaders.Authorization = null;
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.PutAsJsonAsync(path, body)).StatusCode);
         Authenticate(client, id, expired: true);
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.PutAsJsonAsync(path, body)).StatusCode);
-        Authenticate(client, id, "reconstruction.read");
+        Authenticate(client, id, "disasters.read");
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PutAsJsonAsync(path, body)).StatusCode);
         Authenticate(client, id + 1, forgedDemo: true);
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PutAsJsonAsync(path, body)).StatusCode);
@@ -181,7 +190,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task PhaseTransitionsPreserveVersionAndAuditUnderConcurrentRequests()
     {
-        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client); Authenticate(client, id);
+        await using var app = App(); using var client = Client(app); var id = await CreateAsync(client); Authenticate(client, id);
         var path = $"/api/desastres/{id}/fase";
         Assert.Equal(HttpStatusCode.BadRequest, (await client.PutAsJsonAsync(path, new { phase = "Closed", expectedVersion = 1 })).StatusCode);
         var first = await client.PutAsJsonAsync(path, new { phase = "Response", expectedVersion = 1, reason = "Inicio de atención justificado" });
@@ -198,7 +207,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task AuditFailureRollsBackPhaseAndVersion()
     {
-        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client); Authenticate(client, id);
+        await using var app = App(); using var client = Client(app); var id = await CreateAsync(client); Authenticate(client, id);
         using var scope = app.Services.CreateScope(); var db = scope.ServiceProvider.GetRequiredService<DisasterDbContext>();
         await db.Database.ExecuteSqlRawAsync("ALTER TABLE disasters.\"DisasterPhaseAudit\" ADD CONSTRAINT \"TestRejectAudit\" CHECK (false)");
         Assert.Equal(HttpStatusCode.InternalServerError, (await client.PutAsJsonAsync($"/api/desastres/{id}/fase",
@@ -214,7 +223,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task MalformedJsonRemainsBadRequestInDevelopment()
     {
-        await using var app = App(environment: "Development"); using var client = app.CreateClient();
+        await using var app = App(environment: "Development"); using var client = Client(app);
         using var response = await client.PostAsJsonAsync("/api/desastres", new { nombre = "Reporte", ubicacion = "Bogotá",
             severidad = 1.5, descripcion = "Prueba aislada", latitud = 4.71, longitud = -74.07 });
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
@@ -225,7 +234,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public void OrdinaryStartupDoesNotApplyMigrations()
     {
-        using var app = App(migrate: false); using var client = app.CreateClient();
+        using var app = App(migrate: false); using var client = Client(app);
         using var connection = new NpgsqlConnection(_connection); connection.Open();
         using var query = new NpgsqlCommand("SELECT to_regnamespace('disasters')::text", connection);
         Assert.Equal(DBNull.Value, query.ExecuteScalar());
@@ -237,17 +246,18 @@ public sealed class DisasterApiTests : IDisposable
     public void LocalDemoIsRejectedOutsideDevelopment(string environment)
     {
         using var app = App(environment: environment, localDemo: true);
-        Assert.Throws<InvalidOperationException>(() => app.CreateClient());
+        Assert.Throws<InvalidOperationException>(() => Client(app));
     }
 
     [Fact]
     public async Task TypesArePublicButAdministrationIsAuthorizedAndKeepsHistoricalReferences()
     {
-        await using var app = App(); using var client = app.CreateClient();
+        await using var app = App(); using var client = Client(app);
         var types = await client.GetFromJsonAsync<JsonElement>("/api/tipos-desastre");
         Assert.Equal(6, types.GetArrayLength());
+        client.DefaultRequestHeaders.Authorization = null;
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsJsonAsync("/api/tipos-desastre", new { name = "Otro" })).StatusCode);
-        Authenticate(client, 1, role: "reconstruction.read");
+        Authenticate(client, 1, role: "disasters.read");
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync("/api/tipos-desastre", new { name = "Otro" })).StatusCode);
         Authenticate(client, 1, role: "disasters.admin");
         var added = await client.PostAsJsonAsync("/api/tipos-desastre", new { name = "Evento local" });
@@ -271,7 +281,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task UpdatesAreVersionedAndAuditedWhileCreationReceiptsRemainImmutableAcrossInstances()
     {
-        await using var app = App(); await using var peer = App(); using var client = app.CreateClient(); using var retry = peer.CreateClient();
+        await using var app = App(); await using var peer = App(); using var client = Client(app); using var retry = Client(peer);
         var operation = Guid.NewGuid().ToString();
         client.DefaultRequestHeaders.Add("Idempotency-Key", operation); retry.DefaultRequestHeaders.Add("Idempotency-Key", operation);
         var original = new { nombre = "Original", ubicacion = "Bogotá", severidad = 5, descripcion = "Inicial",
@@ -284,6 +294,7 @@ public sealed class DisasterApiTests : IDisposable
         var update = new { nombre = "Actualizado", ubicacion = "Medellín", severidad = 2, descripcion = "Nueva información",
             latitud = 6.2, longitud = -75.5, radio = 900.5, disasterTypeId = 2, startedAt = "2026-11-17T15:00:00Z",
             attentionLevel = 4, expectedVersion = 1, version = 900, phase = "Closed", clientRequestId = Guid.NewGuid(), registeredAt = "1900-01-01T00:00:00Z" };
+        client.DefaultRequestHeaders.Authorization = null;
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.PutAsJsonAsync(path, update)).StatusCode);
         Authenticate(client, id + 1); Assert.Equal(HttpStatusCode.Forbidden, (await client.PutAsJsonAsync(path, update)).StatusCode);
         Authenticate(client, id);
@@ -305,6 +316,7 @@ public sealed class DisasterApiTests : IDisposable
         Assert.Equal("Original", changes.GetProperty("Nombre").GetProperty("Before").GetString());
         Assert.Equal("Actualizado", changes.GetProperty("Nombre").GetProperty("After").GetString());
         Assert.Equal(HttpStatusCode.Conflict, (await retry.PostAsJsonAsync("/api/desastres", update)).StatusCode);
+        retry.DefaultRequestHeaders.Authorization = null;
         Assert.Equal(HttpStatusCode.Unauthorized, (await retry.GetAsync(path + "/historial")).StatusCode);
     }
 
@@ -315,7 +327,7 @@ public sealed class DisasterApiTests : IDisposable
         Assert.Equal(1, (int)DisasterLocation.Core.DisasterPhase.Response);
         Assert.Equal(2, (int)DisasterLocation.Core.DisasterPhase.Recovery);
         Assert.Equal(3, (int)DisasterLocation.Core.DisasterPhase.Closed);
-        await using var app = App(); using var client = app.CreateClient();
+        await using var app = App(); using var client = Client(app);
         var id = await CreateAsync(client); Authenticate(client, id); var path = $"/api/desastres/{id}/fase";
         Assert.Equal(HttpStatusCode.BadRequest, (await client.PutAsJsonAsync(path, new { phase = "Response", expectedVersion = 1 })).StatusCode);
         Assert.Equal(HttpStatusCode.BadRequest, (await client.PutAsJsonAsync(path, new { phase = "Reconstruction", expectedVersion = 1, reason = "No permitido" })).StatusCode);
@@ -345,7 +357,7 @@ public sealed class DisasterApiTests : IDisposable
         var record = new DisasterLocation.Core.Disaster { Nombre = "Matriz", Ubicacion = "Bogotá", Severidad = 1,
             Descripcion = "Escenario controlado", Latitud = 0, Longitud = 0, Phase = (DisasterLocation.Core.DisasterPhase)before };
         db.Disasters.Add(record); await db.SaveChangesAsync();
-        using var client = app.CreateClient(); Authenticate(client, record.Id);
+        using var client = Client(app); Authenticate(client, record.Id);
         var response = await client.PutAsJsonAsync($"/api/desastres/{record.Id}/fase", new { phase = after,
             expectedVersion = 1, reason = "Decisión autorizada de avance", confirmNoCriticalCommitments = true });
         Assert.Equal(allowed ? HttpStatusCode.OK : HttpStatusCode.BadRequest, response.StatusCode);
@@ -367,7 +379,7 @@ public sealed class DisasterApiTests : IDisposable
         var rows = await db.Disasters.OrderBy(x => x.Id).ToListAsync();
         Assert.NotNull(rows[0].CreationSnapshot); Assert.Null(rows[1].CreationSnapshot);
         Assert.All(rows, row => { Assert.Null(row.RegisteredAt); Assert.Null(row.StartedAt); Assert.Null(row.DisasterTypeId); Assert.Null(row.AttentionLevel); });
-        using var client = app.CreateClient(); client.DefaultRequestHeaders.Add("Idempotency-Key", "00000000-0000-0000-0000-000000000001");
+        using var client = Client(app); client.DefaultRequestHeaders.Add("Idempotency-Key", "00000000-0000-0000-0000-000000000001");
         Assert.Equal(HttpStatusCode.OK, (await client.PostAsJsonAsync("/api/desastres", new { nombre = "Histórico", ubicacion = "Bogotá",
             severidad = 4, descripcion = "Conservar", latitud = 4.7, longitud = -74 })).StatusCode);
         client.DefaultRequestHeaders.Remove("Idempotency-Key");
@@ -385,7 +397,7 @@ public sealed class DisasterApiTests : IDisposable
     public void SynchronizationCannotConsumeTheEntireConnectionPool()
     {
         using var app = App(migrate: false).WithWebHostBuilder(builder => builder.UseSetting("Synchronization:ConcurrentRequests", "100"));
-        Assert.Throws<InvalidOperationException>(() => app.CreateClient());
+        Assert.Throws<InvalidOperationException>(() => Client(app));
     }
 
     private static object Operation(string name, string? key = null, object? disaster = null) => new {
@@ -397,7 +409,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task BatchUploadAndPagedDeltaPreserveAll130OperationsAndCreationReceipts()
     {
-        await using var app = App(); await using var peer = App(); using var client = app.CreateClient(); using var retry = peer.CreateClient();
+        await using var app = App(); await using var peer = App(); using var client = Client(app); using var retry = Client(peer);
         var operations = Enumerable.Range(0, 130).Select(i => Operation("Lote " + i)).ToArray();
         foreach (var batch in operations.Chunk(50))
         {
@@ -439,7 +451,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task BatchFailuresAreIndividualAndDoNotPoisonFollowingScopes()
     {
-        await using var app = App(); using var client = app.CreateClient();
+        await using var app = App(); using var client = Client(app);
         using var scope = app.Services.CreateScope(); var db = scope.ServiceProvider.GetRequiredService<DisasterDbContext>();
         await db.Database.ExecuteSqlRawAsync("ALTER TABLE disasters.\"Desastres\" ADD CONSTRAINT \"TestBatchFailure\" CHECK (\"Nombre\" <> 'Persistencia fallida')");
         var key = Guid.NewGuid().ToString();
@@ -470,7 +482,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task BatchRetryAcrossInstancesNeverDuplicatesConcurrentCreations()
     {
-        await using var app = App(); await using var peer = App(); using var first = app.CreateClient(); using var second = peer.CreateClient();
+        await using var app = App(); await using var peer = App(); using var first = Client(app); using var second = Client(peer);
         var body = new { operations = new[] { Operation("Concurrencia", Guid.NewGuid().ToString()) } };
         var responses = await Task.WhenAll(first.PostAsJsonAsync("/api/desastres/batch", body), second.PostAsJsonAsync("/api/desastres/batch", body));
         var statuses = new List<string>(); var ids = new List<int>();
@@ -485,7 +497,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task DeltaDoesNotSkipLateCommitsOrChangesFromTransactionsStartedEarlier()
     {
-        await using var app = App(); using var client = app.CreateClient();
+        await using var app = App(); using var client = Client(app);
         await using var older = new NpgsqlConnection(_connection); await older.OpenAsync();
         await using var newer = new NpgsqlConnection(_connection); await newer.OpenAsync();
         const string insert = "INSERT INTO disasters.\"Desastres\" (\"Nombre\",\"Ubicacion\",\"Severidad\",\"Descripcion\",\"Latitud\",\"Longitud\",\"RegisteredAt\",\"UpdatedAt\") VALUES (@name,'Local',1,'Local',0,0,TIMESTAMPTZ '2026-11-17 12:00:00+00',TIMESTAMPTZ '2026-11-17 12:00:00+00')";
@@ -548,7 +560,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task NewIntegrationAndResponsibilityOperationsNeverExpandAnonymousAccess()
     {
-        await using var app = App(); using var client = app.CreateClient();
+        await using var app = App(); using var client = Client(app);
         var created = await client.PostAsJsonAsync("/api/desastres", new { nombre = "Público histórico", ubicacion = "Local", severidad = 2,
             descripcion = "Contrato compatible", latitud = 4.7, longitud = -74.0,
             registeringOrganizationId = "forged", emergencyResponsibleId = "forged", organizations = new[] { new { organizationId = "forged" } } });
@@ -557,6 +569,7 @@ public sealed class DisasterApiTests : IDisposable
         Assert.Equal(JsonValueKind.Null, row.GetProperty("registeringOrganizationId").ValueKind);
         Assert.Equal(JsonValueKind.Null, row.GetProperty("emergencyResponsibleId").ValueKind);
         Assert.Equal(JsonValueKind.Null, row.GetProperty("organizations").ValueKind);
+        client.DefaultRequestHeaders.Authorization = null;
         foreach (var path in new[] { $"/api/desastres/{id}/reportes", $"/api/desastres/{id}/alertas", "/api/reportes-desastre" })
             Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync(path)).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.PutAsJsonAsync($"/api/desastres/{id}/organismos", new { expectedVersion = 1, organizations = Array.Empty<object>() })).StatusCode);
@@ -569,14 +582,15 @@ public sealed class DisasterApiTests : IDisposable
         createPreliminary = preliminary,
         disaster = preliminary ? new { nombre = "Detección", ubicacion = "Bogotá", severidad = 3,
             descripcion = "Fuente canónica", latitud = 4.7, longitud = -74.0, radio = (double?)null } : null,
-        registeringOrganizationId = "eden:organization:25"
+        registeringOrganizationId = "organization-a"
     };
 
     [Fact]
     public async Task ExternalReportsAreAuthorizedIdempotentAndDetectedAtomically()
     {
-        await using var app = App(); await using var peer = App(); using var client = app.CreateClient(); using var second = peer.CreateClient();
+        await using var app = App(); await using var peer = App(); using var client = Client(app); using var second = Client(peer);
         var request = Incoming("measurement-1");
+        client.DefaultRequestHeaders.Authorization = null;
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.PostAsJsonAsync("/api/reportes-desastre", request)).StatusCode);
         Authenticate(client, 1);
         Assert.Equal(HttpStatusCode.Forbidden, (await client.PostAsJsonAsync("/api/reportes-desastre", request)).StatusCode);
@@ -601,7 +615,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task ConsolidationPreservesOriginalReportsAndAdvancesTheDeltaCursor()
     {
-        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client);
+        await using var app = App(); using var client = Client(app); var id = await CreateAsync(client);
         Authenticate(client, id, "disasters.integration");
         var reportResponse = await client.PostAsJsonAsync("/api/reportes-desastre", Incoming("pending-1", false));
         var report = await reportResponse.Content.ReadFromJsonAsync<JsonElement>(); var reportId = report.GetProperty("id").GetGuid();
@@ -639,7 +653,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task OrganizationsAndGeographyAreVersionedAuditedAndIncludedInDeltaSync()
     {
-        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client); Authenticate(client, id);
+        await using var app = App(); using var client = Client(app); var id = await CreateAsync(client); Authenticate(client, id);
         var organizations = new { expectedVersion = 1, registeringOrganizationId = "eden:registrar:1", emergencyResponsibleId = "responsible:4",
             organizations = new[] { new { organizationId = "eden:12", responsibility = "Rescate" }, new { organizationId = "eden:12", responsibility = "Evacuación" } } };
         Assert.Equal(HttpStatusCode.OK, (await client.PutAsJsonAsync($"/api/desastres/{id}/organismos", organizations)).StatusCode);
@@ -662,7 +676,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task InvalidGeometriesAreRejectedWithoutChangingVersionOrAudit()
     {
-        await using var app = App(); using var client = app.CreateClient(); var id = await CreateAsync(client); Authenticate(client, id);
+        await using var app = App(); using var client = Client(app); var id = await CreateAsync(client); Authenticate(client, id);
         foreach (var polygon in new object[] {
             Polygon([0,0],[1,1],[0,1],[1,0],[0,0]), Polygon([0,0],[1,1],[2,2],[0,0]),
             Polygon([0,0],[1,0],[1,1]), Polygon([0,0],[181,0],[1,1],[0,0]),
@@ -675,7 +689,7 @@ public sealed class DisasterApiTests : IDisposable
     [Fact]
     public async Task FailedOutboxInsertRollsBackBusinessAuditAndDeltaAndHistoricalCreationStillReplays()
     {
-        await using var app = App(); using var client = app.CreateClient();
+        await using var app = App(); using var client = Client(app);
         var key = Guid.NewGuid().ToString(); client.DefaultRequestHeaders.Add("Idempotency-Key", key);
         var body = new { nombre = "Original", ubicacion = "Bogotá", severidad = 3, descripcion = "Histórico", latitud = 4.7, longitud = -74.0 };
         var created = await client.PostAsJsonAsync("/api/desastres", body); var receipt = await created.Content.ReadFromJsonAsync<JsonElement>();

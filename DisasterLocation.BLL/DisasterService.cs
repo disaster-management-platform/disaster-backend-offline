@@ -33,7 +33,7 @@ public sealed partial class DisasterService(IDisasterRepository repository)
     private static DateTimeOffset? Utc(DateTimeOffset? value) => value is null ? null
         : new DateTimeOffset(value.Value.UtcTicks - value.Value.UtcTicks % 10, TimeSpan.Zero);
 
-    public async Task<DisasterSyncResponse> GetChangesAsync(string? cursor, int limit, CancellationToken ct)
+    public async Task<DisasterSyncResponse> GetChangesAsync(string? cursor, int limit, CancellationToken ct, DisasterScope? scope = null)
     {
         long after = 0;
         if (cursor is not null)
@@ -51,15 +51,15 @@ public sealed partial class DisasterService(IDisasterRepository repository)
                 throw new DisasterValidationException(new Dictionary<string, string[]> { ["cursor"] = ["Cursor de sincronización inválido."] });
             }
         }
-        var page = await repository.GetChangesAsync(after, limit, ct);
+        var page = scope is null ? await repository.GetChangesAsync(after, limit, ct) : await repository.GetChangesAsync(after, limit, scope, ct);
         return new DisasterSyncResponse(page.Items.Select(ToResponse).ToArray(), Cursor(page.Cursor), page.HasMore);
     }
 
     private static string Cursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(
         "1:" + value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
 
-    public async Task<IReadOnlyList<DisasterResponse>> GetAllAsync(CancellationToken ct = default) =>
-        (await repository.GetAllAsync(ct)).Select(ToResponse).ToArray();
+    public async Task<IReadOnlyList<DisasterResponse>> GetAllAsync(CancellationToken ct = default, DisasterScope? scope = null) =>
+        (await repository.GetAllAsync(ct)).Where(d => scope is null || scope.CanAccess(d)).Select(ToResponse).ToArray();
 
     public async Task<DisasterResponse?> GetByIdAsync(int id, CancellationToken ct = default)
     {
@@ -67,11 +67,13 @@ public sealed partial class DisasterService(IDisasterRepository repository)
         return disaster is null ? null : ToResponse(disaster);
     }
 
-    public static string CreationCommand(CreateDisasterRequest request)
+    public static string CreationCommand(CreateDisasterRequest request, DisasterCreationIdentity? identity = null)
     {
         var value = Normalize(request, null);
-        return JsonSerializer.Serialize(request with { Nombre = value.Nombre, Ubicacion = value.Ubicacion,
-            Descripcion = value.Descripcion, StartedAt = value.StartedAt });
+        var command = System.Text.Json.Nodes.JsonNode.Parse(JsonSerializer.Serialize(request with { Nombre = value.Nombre, Ubicacion = value.Ubicacion,
+            Descripcion = value.Descripcion, StartedAt = value.StartedAt }))!.AsObject();
+        if (identity is not null) command["_identity"] = JsonSerializer.SerializeToNode(identity);
+        return command.ToJsonString();
     }
 
     private static Disaster Normalize(CreateDisasterRequest request, string? idempotencyKey)
@@ -121,15 +123,20 @@ public sealed partial class DisasterService(IDisasterRepository repository)
     }
 
     public async Task<CreateDisasterResult> CreateAsync(CreateDisasterRequest request,
-        string? idempotencyKey = null, CancellationToken ct = default)
+        string? idempotencyKey = null, CancellationToken ct = default, DisasterCreationIdentity? identity = null)
     {
         var disaster = Normalize(request, idempotencyKey);
+        if (identity is not null) { disaster.CreatedBy = identity.Actor; disaster.RegisteringOrganizationId = identity.Organization; }
         disaster.ClientRequestId ??= Guid.NewGuid();
         disaster.RegisteredAt = disaster.UpdatedAt = Utc(DateTimeOffset.UtcNow);
         var clientRequestId = disaster.ClientRequestId.Value;
         var existing = await repository.GetByClientRequestIdAsync(clientRequestId, ct);
         if (existing is not null)
+        {
+            var owner = DisasterScope.OriginalOrganization(existing) ?? existing.RegisteringOrganizationId;
+            if (identity is not null && owner is not null && owner != identity.Organization) throw new DisasterConflictException();
             return ResolveResult(disaster, new DisasterSaveResult(existing, Created: false));
+        }
 
         if (await repository.GetReportBySourceAsync("manual-web", clientRequestId.ToString(), ct) is not null)
             throw new DisasterConflictException();
@@ -181,6 +188,8 @@ public sealed partial class DisasterService(IDisasterRepository repository)
         if (result.Disaster.CreationSnapshot is null)
             throw new DisasterConflictException("No es posible recuperar el contenido original de esta operación histórica; requiere revisión.");
         var saved = JsonSerializer.Deserialize<Disaster>(result.Disaster.CreationSnapshot)!;
+        if (requested.CreatedBy is not null && (DisasterScope.OriginalOrganization(result.Disaster) ?? result.Disaster.RegisteringOrganizationId) is string owner
+            && owner != requested.RegisteringOrganizationId) throw new DisasterConflictException();
         saved.Id = result.Disaster.Id;
         if (requested.Nombre != saved.Nombre || requested.Ubicacion != saved.Ubicacion
             || requested.Severidad != saved.Severidad || requested.Descripcion != saved.Descripcion
@@ -209,3 +218,5 @@ public sealed partial class DisasterService(IDisasterRepository repository)
         disaster.GeographyJson is null ? null : JsonSerializer.Deserialize<DisasterGeography>(disaster.GeographyJson),
         disaster.OrganizationsJson is null ? null : JsonSerializer.Deserialize<DisasterOrganization[]>(disaster.OrganizationsJson));
 }
+
+public sealed record DisasterCreationIdentity(string Actor, string Organization);

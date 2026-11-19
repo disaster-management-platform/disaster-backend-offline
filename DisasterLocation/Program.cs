@@ -5,7 +5,7 @@ using DisasterLocation.Core;
 using DisasterLocation.DAL;
 using Platform.DAL;
 using Platform.Security;
-using Reconstruction.Application.Ports;
+using DisasterLocation.Security;
 using System.Text.Json.Serialization;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http.Features;
@@ -47,12 +47,25 @@ builder.Services.AddScoped<DisasterService>();
 builder.Services.AddDataAccess(connectionString);
 builder.Services.AddPlatformSecurity(builder.Configuration, builder.Environment);
 var localDemo = builder.Environment.IsDevelopment() && builder.Configuration.GetValue<bool>("Security:LocalDemo");
+builder.Services.AddScoped<DisasterAccess>();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy(DisasterAccess.Read, p => p.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id")
+        .RequireAssertion(c => !string.IsNullOrWhiteSpace(c.User.FindFirst("sub")?.Value) && !string.IsNullOrWhiteSpace(c.User.FindFirst("organization_id")?.Value))
+        .RequireAssertion(c => c.User.IsInRole("disasters.read") || c.User.IsInRole("disasters.write") || c.User.IsInRole("disasters.admin")
+            || c.User.IsInRole("disasters.integration") || c.User.IsInRole("disasters.organization.read") || localDemo && c.User.HasClaim("local_demo", "true")));
+    options.AddPolicy(DisasterAccess.Write, p => p.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id")
+        .RequireAssertion(c => !string.IsNullOrWhiteSpace(c.User.FindFirst("sub")?.Value) && !string.IsNullOrWhiteSpace(c.User.FindFirst("organization_id")?.Value))
+        .RequireAssertion(c => c.User.IsInRole("disasters.write") || c.User.IsInRole("disasters.admin") || localDemo && c.User.HasClaim("local_demo", "true")));
+});
 builder.Services.AddAuthorization(options => options.AddPolicy("DisasterAdministration", policy =>
-    policy.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id").RequireAssertion(context => context.User.IsInRole("disasters.admin")
+    policy.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id")
+        .RequireAssertion(c => !string.IsNullOrWhiteSpace(c.User.FindFirst("sub")?.Value) && !string.IsNullOrWhiteSpace(c.User.FindFirst("organization_id")?.Value)).RequireAssertion(context => context.User.IsInRole("disasters.admin")
         || (localDemo && context.User.HasClaim("local_demo", "true")))));
 
 builder.Services.AddAuthorization(options => options.AddPolicy("DisasterIntegration", policy =>
-    policy.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id").RequireAssertion(context =>
+    policy.RequireAuthenticatedUser().RequireClaim("sub").RequireClaim("organization_id")
+        .RequireAssertion(c => !string.IsNullOrWhiteSpace(c.User.FindFirst("sub")?.Value) && !string.IsNullOrWhiteSpace(c.User.FindFirst("organization_id")?.Value)).RequireAssertion(context =>
         context.User.IsInRole("disasters.integration") || context.User.IsInRole("disasters.admin")
         || (localDemo && context.User.HasClaim("local_demo", "true")))));
 
@@ -93,27 +106,28 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 
 var disasters = app.MapGroup("/api/desastres").WithTags("Desastres");
-disasters.MapGet("/", async (DisasterService service, CancellationToken ct) =>
-    Results.Ok(await service.GetAllAsync(ct)))
+disasters.MapGet("/", async (DisasterService service, DisasterAccess access, CancellationToken ct) =>
+    Results.Ok(await service.GetAllAsync(ct, access.LocalDemo ? null : access.Scope)))
+    .RequireAuthorization(DisasterAccess.Read)
     .WithSummary("Lista los desastres registrados.");
 
-disasters.MapGet("/sync", async (string? cursor, int? limit, DisasterService service, CancellationToken ct) =>
+disasters.MapGet("/sync", async (string? cursor, int? limit, DisasterService service, DisasterAccess access, CancellationToken ct) =>
 {
     var pageSize = limit ?? maxPageSize;
     if (pageSize < 1 || pageSize > maxPageSize)
         return Results.ValidationProblem(new Dictionary<string, string[]> { ["limit"] = [$"El tamaño de página debe estar entre 1 y {maxPageSize}."] });
-    try { return Results.Ok(await service.GetChangesAsync(cursor, pageSize, ct)); }
+    try { return Results.Ok(await service.GetChangesAsync(cursor, pageSize, ct, access.LocalDemo ? null : access.Scope)); }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
-}).RequireRateLimiting("synchronization");
+}).RequireRateLimiting("synchronization").RequireAuthorization(DisasterAccess.Read);
 
-disasters.MapPost("/batch", async (BatchDisasterRequest request, HttpContext http, AsyncBatchAcceptance acceptance, IServiceScopeFactory scopes,
+disasters.MapPost("/batch", async (BatchDisasterRequest request, HttpContext http, DisasterAccess access, AsyncBatchAcceptance acceptance, IServiceScopeFactory scopes,
     Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions> json,
     ILogger<Program> logger, CancellationToken ct) =>
 {
     if (request.Operations is null || request.Operations.Length < 1 || request.Operations.Length > maxOperations)
         return Results.ValidationProblem(new Dictionary<string, string[]> { ["operations"] = [$"Envíe entre 1 y {maxOperations} operaciones."] });
     if (http.Request.Headers["Prefer"].ToString().Split(',').Any(x => x.Trim().Equals("respond-async", StringComparison.OrdinalIgnoreCase)))
-        return await acceptance.AcceptAsync(request, http.Response, ct);
+        return await acceptance.AcceptAsync(request, http.Response, access, ct);
     var results = new List<BatchDisasterResult>(request.Operations.Length);
     foreach (var item in request.Operations)
     {
@@ -127,9 +141,10 @@ disasters.MapPost("/batch", async (BatchDisasterRequest request, HttpContext htt
         {
             var operation = item.Deserialize<BatchDisasterOperation>(json.Value.SerializerOptions);
             if (operation?.ClientRequestId is null || operation.Disaster is null) throw new JsonException();
+            if (!await access.CanReplayAsync(operation.ClientRequestId, ct)) { results.Add(new(key, BatchDisasterStatus.Conflict)); continue; }
             await using var scope = scopes.CreateAsyncScope();
             var saved = await scope.ServiceProvider.GetRequiredService<DisasterService>()
-                .CreateAsync(operation.Disaster, operation.ClientRequestId, ct);
+                .CreateAsync(operation.Disaster, operation.ClientRequestId, ct, access.Identity);
             results.Add(new(key, saved.Created ? BatchDisasterStatus.Created : BatchDisasterStatus.AlreadyProcessed, saved.Disaster));
         }
         catch (JsonException) { results.Add(new(key, BatchDisasterStatus.ValidationError, Errors: new Dictionary<string, string[]> { ["operation"] = ["Operación de creación incompleta o inválida."] })); }
@@ -142,16 +157,17 @@ disasters.MapPost("/batch", async (BatchDisasterRequest request, HttpContext htt
         }
     }
     return Results.Ok(new BatchDisasterResponse(results));
-}).RequireRateLimiting("synchronization");
+}).RequireRateLimiting("synchronization").RequireAuthorization(DisasterAccess.Write);
 
-disasters.MapGet("/{id:int}", async (int id, DisasterService service, CancellationToken ct) =>
+disasters.MapGet("/{id:int}", async (int id, DisasterService service, DisasterAccess access, CancellationToken ct) =>
 {
     var disaster = await service.GetByIdAsync(id, ct);
-    return disaster is null ? Results.NotFound() : Results.Ok(disaster);
-}).WithName("GetDisaster").WithSummary("Consulta un desastre por su identificador.");
+    if (disaster is null) return Results.NotFound();
+    return !await access.CanAccessAsync(id, ct) ? Results.Forbid() : Results.Ok(disaster);
+}).RequireAuthorization(DisasterAccess.Read).WithName("GetDisaster").WithSummary("Consulta un desastre por su identificador.");
 
 disasters.MapPost("/", async (HttpRequest httpRequest, CreateDisasterRequest request,
-    DisasterService service, CancellationToken ct) =>
+    DisasterService service, DisasterAccess access, CancellationToken ct) =>
 {
     string? idempotencyKey = null;
     if (httpRequest.Headers.TryGetValue("Idempotency-Key", out var values))
@@ -165,7 +181,8 @@ disasters.MapPost("/", async (HttpRequest httpRequest, CreateDisasterRequest req
     }
     try
     {
-        var result = await service.CreateAsync(request, idempotencyKey, ct);
+        if (!await access.CanReplayAsync(idempotencyKey, ct)) return Results.Forbid();
+        var result = await service.CreateAsync(request, idempotencyKey, ct, access.Identity);
         return result.Created
             ? Results.Created($"/api/desastres/{result.Disaster.Id}", result.Disaster)
             : Results.Ok(result.Disaster);
@@ -179,12 +196,12 @@ disasters.MapPost("/", async (HttpRequest httpRequest, CreateDisasterRequest req
         return Results.Problem(statusCode: StatusCodes.Status409Conflict,
             title: "Conflicto de idempotencia", detail: exception.Message);
     }
-}).WithSummary("Registra un desastre con sus coordenadas.");
+}).RequireAuthorization(DisasterAccess.Write).WithSummary("Registra un desastre con sus coordenadas.");
 
 disasters.MapPut("/{id:int}/fase", async (int id, ChangeDisasterPhaseRequest request, HttpContext http,
-    DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+    DisasterService service, DisasterAccess access, CancellationToken ct) =>
 {
-    if (!access.CanAccess(id)) return Results.Forbid();
+    if (!await access.CanAccessAsync(id, ct, write: true)) return Results.Forbid();
     try
     {
         var result = await service.ChangePhaseAsync(id, request, PlatformSecurity.Actor(http.User), ct);
@@ -192,11 +209,11 @@ disasters.MapPut("/{id:int}/fase", async (int id, ChangeDisasterPhaseRequest req
     }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException) { return Results.Conflict(new { detail = "El desastre cambió; actualice su versión." }); }
-}).RequireAuthorization(PlatformSecurity.Write);
+}).RequireAuthorization(DisasterAccess.Write);
 disasters.MapPut("/{id:int}", async (int id, UpdateDisasterRequest request, HttpContext http,
-    DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+    DisasterService service, DisasterAccess access, CancellationToken ct) =>
 {
-    if (!access.CanAccess(id)) return Results.Forbid();
+    if (!await access.CanAccessAsync(id, ct, write: true)) return Results.Forbid();
     try
     {
         var result = await service.UpdateAsync(id, request, PlatformSecurity.Actor(http.User), ct);
@@ -204,14 +221,14 @@ disasters.MapPut("/{id:int}", async (int id, UpdateDisasterRequest request, Http
     }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException) { return Results.Conflict(new { detail = "El desastre cambió; actualice su versión." }); }
-}).RequireAuthorization(PlatformSecurity.Write);
+}).RequireAuthorization(DisasterAccess.Write);
 
-disasters.MapGet("/{id:int}/historial", async (int id, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+disasters.MapGet("/{id:int}/historial", async (int id, DisasterService service, DisasterAccess access, CancellationToken ct) =>
 {
-    if (!access.CanAccess(id)) return Results.Forbid();
+    if (!await access.CanAccessAsync(id, ct)) return Results.Forbid();
     if (await service.GetByIdAsync(id, ct) is null) return Results.NotFound();
     return Results.Ok(await service.GetHistoryAsync(id, ct));
-}).RequireAuthorization(PlatformSecurity.Read);
+}).RequireAuthorization(DisasterAccess.Read);
 
 var types = app.MapGroup("/api/tipos-desastre").WithTags("Tipos de desastre");
 types.MapGet("/", async (DisasterService service, CancellationToken ct) => Results.Ok(await service.GetTypesAsync(ct)))
@@ -230,15 +247,15 @@ types.MapPut("/{id:int}/desactivar", async (int id, DisasterService service, Can
     await service.DeactivateTypeAsync(id, ct) ? Results.NoContent() : Results.NotFound())
     .RequireAuthorization("DisasterAdministration");
 disasters.MapGet("/coincidencias", async (int disasterTypeId, string ubicacion, DateTimeOffset startedAt,
-    DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+    DisasterService service, DisasterAccess access, CancellationToken ct) =>
 {
-    try { return Results.Ok((await service.FindSimilarAsync(disasterTypeId, ubicacion, startedAt, ct)).Where(d => access.CanAccess(d.Id))); }
+    try { return Results.Ok(await service.FindSimilarAsync(disasterTypeId, ubicacion, startedAt, ct, access.LocalDemo ? null : access.Scope)); }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
-}).RequireAuthorization(PlatformSecurity.Read);
+}).RequireAuthorization(DisasterAccess.Read);
 disasters.MapPost("/{id:int}/reportes", async (int id, RegisterDisasterReportRequest request,
-    DisasterService service, IDisasterAccess access, HttpContext http, CancellationToken ct) =>
+    DisasterService service, DisasterAccess access, HttpContext http, CancellationToken ct) =>
 {
-    if (!access.CanAccess(id)) return Results.Forbid();
+    if (!await access.CanAccessAsync(id, ct, write: true)) return Results.Forbid();
     if (request.Report is null) return Results.BadRequest();
     try
     {
@@ -249,35 +266,38 @@ disasters.MapPost("/{id:int}/reportes", async (int id, RegisterDisasterReportReq
     }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException) { return Results.Conflict(new { detail = "La operación o la versión cambió; conserva el UUID y revisa el desastre." }); }
-}).RequireAuthorization(PlatformSecurity.Write);
+}).RequireAuthorization(DisasterAccess.Write);
 var reports = app.MapGroup("/api/reportes-desastre").RequireAuthorization("DisasterIntegration");
-reports.MapGet("/", async (DisasterService service, CancellationToken ct) => Results.Ok(await service.GetReportsAsync(null, ct)));
-reports.MapGet("/{reportId:guid}", async (Guid reportId, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
+reports.MapGet("/", async (DisasterService service, DisasterAccess access, CancellationToken ct) =>
+    Results.Ok((await service.GetReportsAsync(null, ct)).Where(r => r.RegisteringOrganizationId == access.Scope.Organization)));
+reports.MapGet("/{reportId:guid}", async (Guid reportId, DisasterService service, DisasterAccess access, CancellationToken ct) =>
 {
     var report = await service.GetReportAsync(reportId, ct);
     if (report is null) return Results.NotFound();
-    if (report.DisasterId is int id && !access.CanAccess(id)) return Results.Forbid();
+    if (report.DisasterId is int id ? !await access.CanAccessAsync(id, ct)
+        : report.RegisteringOrganizationId != access.Scope.Organization && !(report.RegisteringOrganizationId is null && report.ReceivedBy == access.Scope.Actor)) return Results.Forbid();
     return Results.Ok(DisasterService.ReportResponse(report));
 });
-reports.MapPost("/", async (ReceiveDisasterReportRequest request, DisasterService service, HttpContext http, CancellationToken ct) =>
+reports.MapPost("/", async (ReceiveDisasterReportRequest request, DisasterService service, DisasterAccess access, HttpContext http, CancellationToken ct) =>
 {
     try
     {
-        var result = await service.ReceiveReportAsync(request, PlatformSecurity.Actor(http.User), ct);
+        if (request.RegisteringOrganizationId is not null && request.RegisteringOrganizationId != access.Scope.Organization) return Results.Forbid();
+        var result = await service.ReceiveReportAsync(request, PlatformSecurity.Actor(http.User), ct, access.Scope.Organization);
         return result.Created ? Results.Created($"/api/reportes-desastre/{result.Report.Id}", result.Report) : Results.Ok(result.Report);
     }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException e) { return Results.Conflict(new { detail = e.Message }); }
 });
-disasters.MapGet("/{id:int}/reportes", async (int id, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
-    !access.CanAccess(id) ? Results.Forbid() : Results.Ok(await service.GetReportsAsync(id, ct)))
-    .RequireAuthorization(PlatformSecurity.Read);
+disasters.MapGet("/{id:int}/reportes", async (int id, DisasterService service, DisasterAccess access, CancellationToken ct) =>
+    !await access.CanAccessAsync(id, ct) ? Results.Forbid() : Results.Ok(await service.GetReportsAsync(id, ct)))
+    .RequireAuthorization(DisasterAccess.Read);
 disasters.MapPut("/{id:int}/reportes/{reportId:guid}", async (int id, Guid reportId, AssociateDisasterReportRequest request,
-    DisasterService service, IDisasterAccess access, HttpContext http, CancellationToken ct) =>
+    DisasterService service, DisasterAccess access, HttpContext http, CancellationToken ct) =>
 {
-    if (!access.CanAccess(id)) return Results.Forbid();
+    if (!await access.CanAccessAsync(id, ct, write: true)) return Results.Forbid();
     var report = await service.GetReportAsync(reportId, ct);
-    if (report?.DisasterId is int previousId && !access.CanAccess(previousId)) return Results.Forbid();
+    if (report?.DisasterId is int previousId && !await access.CanAccessAsync(previousId, ct, write: true)) return Results.Forbid();
     try
     {
         var result = await service.AssociateReportAsync(id, reportId, request.ExpectedVersion, PlatformSecurity.Actor(http.User), ct);
@@ -285,11 +305,11 @@ disasters.MapPut("/{id:int}/reportes/{reportId:guid}", async (int id, Guid repor
     }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException) { return Results.Conflict(new { detail = "El reporte ya está asociado o la versión cambió." }); }
-}).RequireAuthorization(PlatformSecurity.Write);
+}).RequireAuthorization(DisasterAccess.Write);
 disasters.MapPut("/{id:int}/organismos", async (int id, UpdateDisasterOrganizationsRequest request,
-    DisasterService service, IDisasterAccess access, HttpContext http, CancellationToken ct) =>
+    DisasterService service, DisasterAccess access, HttpContext http, CancellationToken ct) =>
 {
-    if (!access.CanAccess(id)) return Results.Forbid();
+    if (!await access.CanAccessAsync(id, ct, write: true)) return Results.Forbid();
     try
     {
         var result = await service.UpdateOrganizationsAsync(id, request, PlatformSecurity.Actor(http.User), ct);
@@ -297,11 +317,11 @@ disasters.MapPut("/{id:int}/organismos", async (int id, UpdateDisasterOrganizati
     }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException) { return Results.Conflict(); }
-}).RequireAuthorization(PlatformSecurity.Write);
+}).RequireAuthorization(DisasterAccess.Write);
 disasters.MapPut("/{id:int}/geografia", async (int id, UpdateDisasterGeographyRequest request,
-    DisasterService service, IDisasterAccess access, HttpContext http, CancellationToken ct) =>
+    DisasterService service, DisasterAccess access, HttpContext http, CancellationToken ct) =>
 {
-    if (!access.CanAccess(id)) return Results.Forbid();
+    if (!await access.CanAccessAsync(id, ct, write: true)) return Results.Forbid();
     try
     {
         var result = await service.UpdateGeographyAsync(id, request, PlatformSecurity.Actor(http.User), ct);
@@ -309,9 +329,9 @@ disasters.MapPut("/{id:int}/geografia", async (int id, UpdateDisasterGeographyRe
     }
     catch (DisasterValidationException e) { return Results.ValidationProblem(e.Errors); }
     catch (DisasterConflictException) { return Results.Conflict(); }
-}).RequireAuthorization(PlatformSecurity.Write);
-disasters.MapGet("/{id:int}/alertas", async (int id, DisasterService service, IDisasterAccess access, CancellationToken ct) =>
-    !access.CanAccess(id) ? Results.Forbid() : Results.Ok(await service.GetAlertsAsync(id, ct)))
-    .RequireAuthorization(PlatformSecurity.Read);
+}).RequireAuthorization(DisasterAccess.Write);
+disasters.MapGet("/{id:int}/alertas", async (int id, DisasterService service, DisasterAccess access, CancellationToken ct) =>
+    !await access.CanAccessAsync(id, ct) ? Results.Forbid() : Results.Ok(await service.GetAlertsAsync(id, ct)))
+    .RequireAuthorization(DisasterAccess.Read);
 app.Run();
 public partial class Program { }

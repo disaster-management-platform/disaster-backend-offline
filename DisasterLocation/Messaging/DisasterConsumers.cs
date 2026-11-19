@@ -63,7 +63,13 @@ public sealed class DisasterConsumers(IServiceScopeFactory scopes, IConfiguratio
             BatchDisasterResult result;
             try {
                 var command = JsonSerializer.Deserialize<CreateDisasterRequest>(receipt.CommandJson)!;
-                var saved = await scope.ServiceProvider.GetRequiredService<DisasterService>().CreateAsync(command, id.ToString(), ct);
+                using var stored = JsonDocument.Parse(receipt.CommandJson);
+                if (!stored.RootElement.TryGetProperty("_identity", out var acceptedIdentity))
+                    throw new InvalidOperationException("Recepción histórica pendiente de reconciliación de ámbito.");
+                var identity = acceptedIdentity.Deserialize<DisasterCreationIdentity>();
+                if (identity is null || string.IsNullOrWhiteSpace(identity.Actor) || string.IsNullOrWhiteSpace(identity.Organization))
+                    throw new InvalidOperationException("Ámbito de recepción inválido.");
+                var saved = await scope.ServiceProvider.GetRequiredService<DisasterService>().CreateAsync(command, id.ToString(), ct, identity);
                 result = new(id.ToString(), saved.Created ? BatchDisasterStatus.Created : BatchDisasterStatus.AlreadyProcessed, saved.Disaster);
             }
             catch (DisasterValidationException error) { result = new(id.ToString(), BatchDisasterStatus.ValidationError, Errors: error.Errors); }

@@ -12,7 +12,7 @@ public sealed partial class DisasterService
     }
 
     public async Task<(DisasterReportResponse Report, bool Created)> ReceiveReportAsync(
-        ReceiveDisasterReportRequest request, string actor, CancellationToken ct)
+        ReceiveDisasterReportRequest request, string actor, CancellationToken ct, string? organization = null)
     {
         var errors = new Dictionary<string, string[]>();
         ValidateText("sourceId", request.SourceId, 200, errors);
@@ -30,15 +30,16 @@ public sealed partial class DisasterService
         if (request.CreatePreliminary)
         {
             preliminary = Normalize(request.Disaster!, null);
+            preliminary.CreatedBy = actor;
             preliminary.ClientRequestId = Guid.NewGuid();
-            preliminary.RegisteringOrganizationId ??= request.RegisteringOrganizationId?.Trim();
+            preliminary.RegisteringOrganizationId ??= organization ?? request.RegisteringOrganizationId?.Trim();
             preliminary.Phase = DisasterPhase.Detected;
             preliminary.RegisteredAt = preliminary.UpdatedAt = Utc(DateTimeOffset.UtcNow);
         }
         var report = new DisasterReport { Id = Guid.NewGuid(), SourceKind = request.SourceKind!.Value,
             SourceId = request.SourceId!.Trim(), SourceReportId = request.SourceReportId!.Trim(),
             ReceivedAt = Utc(DateTimeOffset.UtcNow)!.Value, ReceivedBy = actor,
-            RegisteringOrganizationId = request.RegisteringOrganizationId?.Trim(),
+            RegisteringOrganizationId = organization ?? request.RegisteringOrganizationId?.Trim(),
             OriginalContent = request.Content.GetRawText(),
             ReceiptSnapshot = JsonSerializer.Serialize(new { request.SourceKind, request.CreatePreliminary, Disaster = preliminary is null ? null : request.Disaster,
                 RegisteringOrganizationId = request.RegisteringOrganizationId?.Trim(), Content = request.Content }) };
@@ -79,13 +80,13 @@ public sealed partial class DisasterService
         && CityKey(disaster.Ubicacion) == CityKey(location);
 
     public async Task<IReadOnlyList<DisasterResponse>> FindSimilarAsync(int typeId, string location,
-        DateTimeOffset startedAt, CancellationToken ct)
+        DateTimeOffset startedAt, CancellationToken ct, DisasterScope? scope = null)
     {
         var errors = new Dictionary<string, string[]>();
         ValidateText("ubicacion", location, 200, errors);
         if (typeId <= 0) errors["disasterTypeId"] = ["Seleccione un tipo válido."];
         if (errors.Count != 0) throw new DisasterValidationException(errors);
-        return (await repository.GetAllAsync(ct)).Where(d => Similar(d, typeId, location, startedAt))
+        return (await repository.GetAllAsync(ct)).Where(d => (scope is null || scope.CanAccess(d)) && Similar(d, typeId, location, startedAt))
             .OrderBy(d => (d.StartedAt!.Value - startedAt).Duration()).Select(ToResponse).ToArray();
     }
 
@@ -157,7 +158,10 @@ public sealed partial class DisasterService
                 errors["organizations"] = ["No repita una responsabilidad del mismo organismo."];
         }
         if (errors.Count != 0) throw new DisasterValidationException(errors);
-        if (await repository.GetByIdAsync(id, ct) is null) return null;
+        var current = await repository.GetByIdAsync(id, ct);
+        if (current is null) return null;
+        if (DisasterScope.OriginalOrganization(current) is null && current.RegisteringOrganizationId is not null && request.RegisteringOrganizationId != current.RegisteringOrganizationId)
+            throw new DisasterValidationException(new Dictionary<string, string[]> { ["registeringOrganizationId"] = ["El organismo registrador no puede sustituirse ni eliminarse mediante una actualización de participantes."] });
         var organizations = request.Organizations!.Select(x => new DisasterOrganization(x.OrganizationId.Trim(), x.Responsibility.Trim())).ToArray();
         if (!await repository.UpdateContextAsync(id, request.ExpectedVersion, actor, "OrganizationsUpdated", null,
                 JsonSerializer.Serialize(organizations), request.RegisteringOrganizationId?.Trim(), request.EmergencyResponsibleId?.Trim(), null, ct))
