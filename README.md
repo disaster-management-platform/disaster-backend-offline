@@ -249,3 +249,14 @@ Active `Ingestion__DispatcherEnabled=true` para publicar comandos y eventos y `I
 Los exchanges `disasters.commands` y `disasters.events` separan comandos y eventos. La cola durable `disasters.create` utiliza ACK manual y DLQ `disasters.create.dlq`. Los fallos recuperables se reactivan reenviando el mismo comando, sin acceder a la administración del broker. `Ingestion__MaxRecoveries` limita las reactivaciones (3 inicialmente, máximo 10); `Ingestion__RecoveryDelaySeconds` fija la base del backoff exponencial (10 segundos inicialmente). La reactivación comprueba el cupo pendiente y es atómica. Los mensajes antiguos de DLQ no reabren resultados guardados. Tras agotar el límite, `recoveryExhausted` indica revisión administrativa: corregir la causa y autorizar expresamente un aumento acotado del límite, consistente entre instancias, antes de reintentar la misma identidad. No se modifican éxitos ni rechazos permanentes. Los eventos confirmados quedan conservados y disponibles en `disasters.events.pending`; publicación no significa notificación entregada a organismos.
 
 Los despachadores reclaman lotes de `Ingestion__DispatchBatchSize` (10 inicialmente, entre 1 y 50) con `SKIP LOCKED` y leases de 30 segundos, renovados por fila inmediatamente antes de publicar; los eventos se atienden antes de los comandos y la espera configurada se realiza una vez por ciclo, no por mensaje; no mantienen transacciones abiertas al contactar RabbitMQ. Confirmaciones perdidas pueden producir duplicados, que se resuelven mediante la identidad persistente. Los eventos históricos conservan sus IDs y payloads. Para validar localmente el flujo esencial: `python3 scripts/async_ingestion_test.py`, con `TEST_POSTGRES_DSN` por socket local y RabbitMQ local accesible. El escenario utiliza y elimina un virtual host exclusivo.
+
+### Container image
+
+Build from the repository root, using BuildKit:
+
+```sh
+docker build --secret id=nuget_credentials,src="$NUGET_CREDENTIALS_FILE" -t disaster-backend-offline:local .
+```
+The private file contains the NuGet credential value `Username=<account>;Password=<token>` for GitHubPackages. Use a read-only package token, permissions 0600; never pass it as an ARG, copy it into a layer, or use a runtime secret for restore.
+
+The runtime runs as the image's non-root application UID, listens on 8080, and receives configuration and trust roots externally. `SDK_IMAGE` and `RUNTIME_IMAGE` can be set to approved image digests for repeatable releases. Version tags are pinned; use approved digests for immutable releases. Configure HTTPS at the trusted ingress and preserve HTTPS issuer/downstream validation; private CA roots must be installed through the deployment trust configuration, never bypassed. Publish ports only as required. No build or normal startup applies database migrations. Supply runtime credentials using the deployment secret store.
