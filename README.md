@@ -1,276 +1,328 @@
-# Registro de desastres en .NET
+<div align="center">
 
-Proyecto de taller en .NET 10: registra nombre, ubicación, severidad (1–5), descripción y coordenadas; consulta los reportes en un mapa. La presentación es una web responsive que funciona en computador y navegador móvil. Cualquier aplicación móvil nativa puede consumir la misma API JSON a través del gateway.
+# RECONECTA
 
-## Ejecutar
+### Disaster Management
 
-Requisitos: SDK de .NET 10, acceso a GitHub Packages para restaurar las bibliotecas privadas y una conexión PostgreSQL propia de esta API. La conexión se proporciona mediante `ConnectionStrings__Disasters`, fuera de los archivos versionados. Las conexiones TCP requieren `SSL Mode=VerifyFull` y una CA confiable.
+**De la emergencia a la reconstrucción**
 
-Desde la raíz de la solución:
+Servicio propietario del ciclo de vida de los eventos de desastre.
 
-```bash
-dotnet restore
-dotnet build
+![.NET](https://img.shields.io/badge/.NET_10-512BD4?style=for-the-badge)
+![Capas](https://img.shields.io/badge/Architecture-Layers-11847F?style=for-the-badge)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?style=for-the-badge)
+![RabbitMQ](https://img.shields.io/badge/RabbitMQ-FF6600?style=for-the-badge)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge)
+
+**Pontificia Universidad Javeriana**
+
+Arquitectura de Software · 2026
+
+[Plataforma completa](https://github.com/disaster-management-platform/disaster-platform-infrastructure) · [Arquitectura](#arquitectura) · [Demostración](#demostración) · [Instalación](#instalación-y-ejecución)
+
+</div>
+
+---
+
+## Demostración
+
+<div align="center">
+
+[![Demostración RECONECTA](https://img.youtube.com/vi/HVCKoTRAxu8/hqdefault.jpg)](https://youtu.be/HVCKoTRAxu8)
+
+[Ver demostración funcional de RECONECTA](https://youtu.be/HVCKoTRAxu8)
+
+</div>
+
+## Descripción
+
+`disaster-backend-offline` implementa el módulo de Gestión de Desastres de RECONECTA. Es el propietario canónico de los eventos, sus fases, geografía, reportes asociados y referencias organizacionales. Implementa arquitectura en capas con ASP.NET Core Minimal APIs, BLL y DAL distribuido como paquetes NuGet. Atiende clientes web y móviles mediante REST, y admite recepción asíncrona durable para sincronización masiva.
+
+## Contenido
+
+- [Funcionalidades](#funcionalidades)
+- [Arquitectura](#arquitectura)
+- [Decisiones arquitectónicas](#decisiones-arquitectónicas)
+- [Tecnologías y justificación](#tecnologías-y-justificación)
+- [Estructura del repositorio](#estructura-del-repositorio)
+- [Integración con otros componentes](#integración-con-otros-componentes)
+- [Persistencia](#persistencia)
+- [Contratos de comunicación](#contratos-de-comunicación)
+- [Seguridad](#seguridad)
+- [Instalación y ejecución](#instalación-y-ejecución)
+- [Pruebas](#pruebas)
+- [Alcance y validación](#alcance-y-validación)
+- [Repositorios relacionados](#repositorios-relacionados)
+- [Autores](#autores)
+
+## Funcionalidades
+
+| Funcionalidad | Descripción |
+| --- | --- |
+| Registro | Creación manual o preliminar por reporte externo normalizado. |
+| Ciclo de vida | Transiciones autorizadas, control de versiones y auditoría. |
+| Geografía | Coordenadas, radio opcional, polígonos GeoJSON y referencias territoriales. |
+| Consolidación | Sugerencias por tipo, municipio y ventana de ±72 h; asociación explícita de reportes. |
+| Offline First | Batch, Delta y recibos durables; el almacenamiento offline reside en Android. |
+| Alertas | Persistencia y publicación de eventos de detección, fase, atención y área; no equivale a entrega de notificaciones. |
+
+## Arquitectura
+
+### Vista lógica
+
+La API depende de BLL y compone las implementaciones del DAL, mientras la BLL consume contratos de Core. Los workers forman parte del servicio, no del Gateway.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"background":"#ffffff","lineColor":"#64748b"},"flowchart":{"curve":"linear"}}}%%
+flowchart LR
+    G["API Gateway"] -->|"REST / JSON"| A["Minimal APIs"]
+    subgraph S["Servicio Desastres"]
+      A --> B["DisasterService / BLL"]
+      B --> C["Core / IDisasterRepository"]
+      B --> D["DAL / EF Core"]
+      A --> R["AsyncBatchAcceptance"]
+      R --> D
+      W["Dispatcher"] --> D
+      X["Consumers"] --> B
+    end
+    D -->|"SQL / TLS"| P[(PostgreSQL disasters)]
+    W -->|AMQP| Q["RabbitMQ"]
+    Q -->|AMQP| X
+    class G,A access;
+    class B,R,W,X logic;
+    class C contract;
+    class D,P persistence;
+    class Q integration;
+    classDef access fill:#DBEAFE,stroke:#7B9ABD,color:#19363F;
+    classDef logic fill:#DCFCE7,stroke:#86B49A,color:#19363F;
+    classDef contract fill:#FEF3C7,stroke:#CBB16F,color:#19363F;
+    classDef persistence fill:#EDE9FE,stroke:#AA98CD,color:#19363F;
+    classDef integration fill:#FFEDD5,stroke:#CEA778,color:#19363F;
+    classDef identity fill:#FCE7F3,stroke:#C99AB6,color:#19363F;
 ```
 
-Antes del primer arranque, aplica las migraciones con el comando administrativo descrito en la sección de persistencia.
 
-Terminal 1 — API, con la ruta del archivo local protegido en `DISASTERS_CONNECTION_FILE`:
+### Responsabilidades de los componentes
+
+| Componente | Responsabilidad |
+| --- | --- |
+| DisasterLocation | Endpoints, composición DI, autenticación y workers. |
+| DisasterLocation.BLL | Validaciones, creación, actualizaciones y reglas de transición. |
+| DisasterLocation.Core | DTOs del contrato HTTP; modelos compartidos en DisasterPlatform.Core. |
+| DisasterPlatform.DAL | Repositorio, recibos, esquema, auditoría y Outbox. |
+| DisasterDispatcher / DisasterConsumers | Publicación confirmada y consumo de comandos con recuperación acotada. |
+
+### Vista de procesos y sincronización asíncrona
+
+El proceso ASP.NET Core aloja Kestrel y los servicios de fondo habilitados. Pueden desplegarse instancias con perfiles de API, dispatcher o consumers; RabbitMQ y PostgreSQL son procesos independientes.
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"background":"#ffffff","lineColor":"#64748b"},"flowchart":{"curve":"linear"}}}%%
+sequenceDiagram
+    participant M as Android
+    participant G as YARP
+    participant A as API
+    participant P as PostgreSQL
+    participant D as Dispatcher
+    participant Q as RabbitMQ
+    participant C as Consumer
+    M->>G: Batch + UUID + Prefer respond-async
+    G->>A: Reenviar operación
+    A->>P: Persistir comando y recibo
+    P-->>A: Commit
+    A-->>M: 202 Accepted vía Gateway
+    D->>P: Reclamar trabajo con lease
+    D->>Q: Publicar comando
+    Q->>C: Entregar comando
+    C->>P: Crear desastre y confirmar resultado
+    C-->>Q: ACK
+    M->>G: Repetir mismo UUID y contenido
+    G->>A: Consultar resultado por reenvío
+    A->>P: Recuperar recibo
+    A-->>M: Created / AlreadyProcessed vía Gateway
+```
+### Ciclo de vida
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"background":"#ffffff","lineColor":"#64748b"},"flowchart":{"curve":"linear"}}}%%
+stateDiagram-v2
+    [*] --> Registered: Registro manual
+    [*] --> Detected: Reporte externo
+    Detected --> Registered
+    Registered --> Assessment
+    Registered --> Response
+    Registered --> Recovery
+    Registered --> Closed
+    Assessment --> Response
+    Assessment --> Recovery
+    Assessment --> Closed
+    Response --> Recovery
+    Response --> Closed
+    Recovery --> Reconstruction
+    Recovery --> Closed
+    Reconstruction --> Closed
+```
+Las transiciones usan `expectedVersion`; los saltos y el cierre requieren justificación, y el cierre exige confirmación de ausencia de compromisos críticos. No existe verificación automática completa entre dominios.
+
+## Decisiones arquitectónicas
+
+| Atributo de calidad | Decisión | Mecanismo y compromiso |
+| --- | --- | --- |
+| Disponibilidad | Procesamiento desacoplado | Recepción durable y workers independientes; requiere persistencia disponible. |
+| Resiliencia | Idempotencia | UUID, recibos inmutables, reintentos y DLQ; puede requerir intervención. |
+| Escalabilidad | Batch y Delta | Lotes de 50, páginas de 50 y concurrencia 2 por defecto; protege tráfico interactivo. |
+| Integridad | Control optimista | Versión, índice único y transacciones locales; los conflictos son visibles. |
+| Interoperabilidad | REST y AMQP | Contratos canónicos sin compartir tablas con otros servicios. |
+| Modificabilidad | Capas y repositorios | Core abstrae persistencia; paquetes deben mantenerse compatibles. |
+
+## Tecnologías y justificación
+
+| Tecnología | Justificación para la integración |
+| --- | --- |
+| .NET 10 / ASP.NET Core | Minimal APIs y DI integran clientes Kotlin, Razor y Java mediante HTTP sin acoplar runtimes. |
+| EF Core / Npgsql | El DAL comparte mecanismos PostgreSQL con Reconstrucción sin conceder acceso cruzado a esquemas. |
+| RabbitMQ / AMQP | Desacopla recepción del procesamiento y permite repartir consumidores; admite entrega repetida. |
+| PostgreSQL / Supabase | Índices, transacciones y secuencias preservan recibos y cursores entre réplicas. |
+| NuGet | Distribuye Core, DAL y Security con versiones explícitas; evita duplicar código. |
+| Docker | Empaqueta el servicio y permite configurar perfiles de ejecución desde Infrastructure. |
+
+## Estructura del repositorio
+
+```text
+disaster-backend-offline/
+├── DisasterLocation/             # API, Messaging, Security
+├── DisasterLocation.BLL/         # DisasterService, Integration, GeographyValidation
+├── DisasterLocation.Core/        # Contracts.cs
+├── DisasterLocation.Tests/
+├── scripts/                      # smoke_test.py, async_ingestion_test.py
+├── DisasterLocation.sln
+├── Dockerfile
+└── README.md
+```
+
+## Integración con otros componentes
+
+El portal y Android consumen el Gateway. Integration Service envía reportes externos normalizados a `/api/reportes-desastre`. Evaluación de Daños y Reconstrucción consultan al propietario por REST para verificar contexto. La publicación AMQP utiliza `disasters.commands`, `disasters.events`, `disasters.create`, `disasters.create.dlq` y `disasters.events.pending`. No se leen tablas de Eden ni de Reconstrucción.
+
+Los despachadores reclaman trabajo con `SKIP LOCKED` y leases de 30 s; no mantienen una transacción abierta mientras publican. Confirmaciones perdidas pueden repetir una entrega, resuelta por la identidad persistida.
+
+## Persistencia
+
+El esquema `disasters` pertenece exclusivamente a este servicio. Las versiones actuales referenciadas son Core 5.0.0, DAL 7.0.0 y Security 1.0.0. EF Core conserva `ClientRequestId`, snapshot original, `CreatedBy` dentro del snapshot, versión, auditoría, recibos y Outbox. Delta filtra por ámbito antes de paginar, y utiliza `SyncSequence` con asignación bajo advisory lock transaccional. El cursor no se adelanta a escrituras pendientes. Los datos históricos desconocidos no se inventan. La creación original y el GET vigente pueden devolver versiones distintas deliberadamente.
+
+## Contratos de comunicación
+
+| Método | Ruta | Responsabilidad |
+| --- | --- | --- |
+| GET / POST | `/api/desastres` | Listado / registro idempotente. |
+| GET / PUT | `/api/desastres/{id}` | Detalle / modificación versionada. |
+| PUT | `/api/desastres/{id}/fase` | Transición de fase. |
+| GET | `/api/desastres/{id}/historial` | Auditoría. |
+| GET / POST | `/api/tipos-desastre` | Catálogo / alta. |
+| PUT | `/api/tipos-desastre/{id}/desactivar` | Desactivación. |
+| POST | `/api/desastres/batch` | Lotes con resultados por UUID. |
+| GET | `/api/desastres/sync` | Delta por cursor. |
+| GET | `/api/desastres/coincidencias` | Sugerencias. |
+| GET / POST | `/api/reportes-desastre` | Recepción externa. |
+| GET | `/api/reportes-desastre/{reportId}` | Recibo. |
+| GET / POST | `/api/desastres/{id}/reportes` | Reportes asociados / asociación manual. |
+| PUT | `/api/desastres/{id}/reportes/{reportId}` | Vincular reporte existente. |
+| PUT | `/api/desastres/{id}/organismos` | Responsabilidades. |
+| PUT | `/api/desastres/{id}/geografia` | Área y referencias. |
+| GET | `/api/desastres/{id}/alertas` | Eventos registrados. |
+Una creación individual con `Idempotency-Key` UUID devuelve 201 al crear, 200 al recuperar el mismo contenido y 409 ante contenido diferente. Batch con `Prefer: respond-async` devuelve 202 para aceptación durable, no confirmación final. `radio` desconocido permanece null. El reporte exige nombre, ubicación, severidad 1–5, descripción y coordenadas válidas.
+
+## Seguridad
+
+El servicio implementa `Disasters/Security` mediante el archivo `DisasterLocation/Security/DisasterAccess.cs` y el paquete común Security. Utiliza `disasters.read`, `disasters.write`, `disasters.admin`, `disasters.organization.read` para lectura técnica y `disasters.integration` para ingesta autorizada. El creador autorizado y el administrador de su organización pueden acceder a nuevos registros sin enumerarlos manualmente en el JWT; otros usuarios requieren concesión `disaster_id` y ámbito organizacional compatible. El catálogo mantiene lectura pública. La autoridad HTTPS y audiencia se configuran externamente. Los consumidores recuperan actor y organización del comando persistido, nunca el JWT. LocalDemo solo en Development.
+
+## Instalación y ejecución
+
+Para ejecutar la plataforma completa, consultar [Infrastructure](https://github.com/disaster-management-platform/disaster-platform-infrastructure).
+
+```bash
+git clone https://github.com/disaster-management-platform/disaster-backend-offline.git
+cd disaster-backend-offline
+```
+```bash
+dotnet restore
+dotnet build --no-restore
+docker build --secret id=nuget_credentials,src="$NUGET_CREDENTIALS_FILE" -t disaster-backend-offline:local .
+```
+
+Requiere .NET SDK 10 y acceso de lectura a GitHub Packages. El archivo protegido de BuildKit contiene `Username=<account>;Password=<token>` para GitHubPackages. No incorporar el token en la imagen. El contenedor escucha en 8080 y se ejecuta sin privilegios de root. Configurar credenciales y CA de confianza externamente.
+
+### Configuración y arranque local
+
+`ConnectionStrings__Disasters`, `Security__Authority`, `Security__Audience`, `Ingestion__HostName`, `Ingestion__Port`, `Ingestion__VirtualHost`, `Ingestion__UserName`, `Ingestion__Password` se suministran externamente. Para TCP PostgreSQL se exige `SSL Mode=VerifyFull`. Habilitar los perfiles requeridos con `Ingestion__DispatcherEnabled=true` y `Ingestion__ConsumersEnabled=true`.
 
 ```bash
 ConnectionStrings__Disasters="$(cat "$DISASTERS_CONNECTION_FILE")" \
   dotnet run --project DisasterLocation --no-launch-profile --urls http://localhost:5156
 ```
 
-Terminal 2 — gateway e interfaz, desde esta misma raíz y con el repositorio independiente `disaster-api-gateway` situado junto a este repositorio:
+Antes del primer arranque, un operador autorizado aplica migraciones con `--Database:Migrate=true` y una conexión administrativa separada. El inicializador compartido puede aplicar ambos contextos: hacerlo solo en el entorno autorizado, con respaldo previo. El proceso normal no migra. `GET /api/tipos-desastre` permite comprobar la API; OpenAPI en `/openapi/v1.json` en Development.
+
+## Pruebas
 
 ```bash
-ReverseProxy__Clusters__disasters-api__Destinations__local__Address=http://localhost:5156/ \
-  dotnet run --project ../disaster-api-gateway/DisasterLocation.Gateway --launch-profile http
-```
-
-Abre **http://localhost:5080**. Escribe los datos, selecciona un punto en el mapa (o escribe latitud y longitud) y registra el desastre. Se agrega a la lista y al mapa. Los puntos usan colores según la severidad. El nombre de la ubicación es descriptivo: no se convierte automáticamente una dirección en coordenadas.
-
-En las configuraciones de lanzamiento, proporciona la conexión únicamente al proceso API. El Gateway solo necesita la dirección HTTP del destino.
-
-## Separación de arquitectura
-
-```mermaid
-flowchart LR
-    W[Web responsive] --> G[API Gateway · YARP :5080]
-    M[Cliente móvil · mismo JSON] --> G
-    G --> A[API · endpoints HTTP :5156]
-    A --> B[BLL · reglas de negocio]
-    B --> R[IDisasterRepository]
-    R --> D[DAL · repositorio + DbContext]
-    D --> S[(PostgreSQL)]
-```
-
-| Proyecto | Responsabilidad | Archivo principal |
-| --- | --- | --- |
-| `DisasterLocation.Core` | DTOs HTTP propios; entidades e interfaces mediante `DisasterPlatform.Core`. | [Contracts.cs](DisasterLocation.Core/Contracts.cs) |
-| `DisasterLocation.BLL` | Valida y normaliza los datos. Usa la abstracción del repositorio. | [DisasterService.cs](DisasterLocation.BLL/DisasterService.cs) |
-| `DisasterPlatform.DAL` (NuGet) | Configura PostgreSQL, mapea la tabla, consulta y guarda usando EF Core. | [Repositorio compartido](https://github.com/disaster-management-platform/disaster-platform-dal) |
-| `DisasterLocation` | Recibe HTTP, llama a la BLL y devuelve códigos HTTP y JSON. Conecta las implementaciones mediante inyección de dependencias. | [Program.cs](DisasterLocation/Program.cs) |
-| `DisasterLocation.Gateway` (repositorio independiente) | Reenvía `/api/*` a la API con YARP y sirve los archivos de presentación. | [Program.cs](../disaster-api-gateway/DisasterLocation.Gateway/Program.cs), [appsettings.json](../disaster-api-gateway/DisasterLocation.Gateway/appsettings.json) |
-
-La BLL y el DAL referencian Core. La API referencia BLL y DAL para registrar sus servicios. El gateway no tiene referencias a estos proyectos: no valida desastres ni accede a la base de datos.
-
-### El DAL, paso a paso
-
-1. La API lee `Idempotency-Key`. La BLL valida el UUID y el reporte, y consulta si esa operación ya existe.
-2. La inyección de dependencias resuelve esa interfaz con `DisasterRepository`, implementado en el DAL.
-3. Si la operación existe, la BLL compara los datos normalizados y devuelve el registro, o un conflicto si cambiaron.
-4. Si no existe, el repositorio guarda con EF Core. Un índice único sobre `ClientRequestId` evita duplicados incluso si llegan dos solicitudes al mismo tiempo. Si otra solicitud guardó primero, se recupera su registro y la BLL también compara el contenido.
-5. La API responde `201 Created` al crear, `200 OK` al recuperar o `409 Conflict` si se reutilizó la clave con otros datos. El gateway conserva estas respuestas.
-
-Para consultar se recorre el mismo camino con `GetAllAsync` o `GetByIdAsync`. El acceso a EF Core y PostgreSQL está en el DAL. Puedes reemplazar el repositorio sin modificar los clientes ni las reglas de negocio.
-
-La persistencia se distribuye mediante `DisasterPlatform.Core 4.0.0` y `DisasterPlatform.DAL 6.0.0`. Utiliza el esquema `disasters` de PostgreSQL y conserva `ClientRequestId`, el índice único, el ciclo de vida y la auditoría. La API conserva los campos originales y añade `radio` nullable, `phase` y `version` a las respuestas. `radio` es opcional en la creación y, cuando se informa, debe ser mayor que cero y no superar 1.000.000 metros.
-
-Las migraciones se ejecutan explícitamente con una conexión administrativa separada. Con su archivo protegido indicado en `MIGRATION_CONNECTION_FILE`:
-
-```bash
-ConnectionStrings__Disasters="$(cat "$MIGRATION_CONNECTION_FILE")" \
-  dotnet run --project DisasterLocation --no-launch-profile -- --Database:Migrate=true
-```
-
-Este comando aplica las cadenas PostgreSQL de ambos contextos del DAL y termina sin abrir el servidor HTTP. El arranque normal no aplica migraciones ni crea archivos locales. No se reutilizan historiales de SQLite.
-
-Este servicio es el único escritor del esquema `disasters`. Reconstrucción lo consulta mediante HTTP. Las credenciales administrativas se reservan para migraciones y las APIs utilizan roles propios.
-
-Para agregar otro cambio de esquema, desde el repositorio `disaster-platform-dal`:
-
-```bash
-dotnet tool restore
-dotnet ef migrations add NombreDelCambio --project DisasterPlatform.DAL --context DisasterDbContext
-```
-
-La herramienta `dotnet-ef` está fijada a la misma versión que EF Core en `dotnet-tools.json`. La fábrica de diseño utiliza `ConnectionStrings__Disasters` y permite generar las migraciones sin iniciar la API. Los cambios se aplican con el comando explícito de migración y credenciales administrativas; la API utiliza sus propias credenciales de ejecución.
-
-La validación JWT común se consume mediante `DisasterPlatform.Security 1.0.0`. Creación individual/Batch, listado, Delta, detalle, historial y actualización requieren identidad. Desastres usa `disasters.read`, `disasters.write` y `disasters.admin`; no reutiliza permisos de Reconstrucción. El administrador tiene ámbito de su organización; un creador con permiso puede leer y administrar sus registros nuevos sin agregar IDs al JWT. Otros usuarios necesitan concesión `disaster_id` y organización propietaria/participante compatible. Las identidades técnicas lectoras usan `disasters.organization.read`, sin permiso de escritura. El catálogo conserva su lectura pública expresamente autorizada. `Security__Authority` y `Security__Audience` conservan validación HTTPS de issuer, firma, audience y expiración; LocalDemo sigue limitado a Development.
-
-Las transiciones autorizadas son:
-
-| Fase actual | Fases siguientes |
-| --- | --- |
-| Detected | Registered |
-| Registered | Assessment, Response, Recovery, Closed |
-| Assessment | Response, Recovery, Closed |
-| Response | Recovery, Closed |
-| Recovery | Reconstruction, Closed |
-| Reconstruction | Closed |
-| Closed | Ninguna |
-
-`Registered=0`, `Response=1`, `Recovery=2` y `Closed=3` conservan sus valores; `Detected=4`, `Assessment=5` y `Reconstruction=6`. La creación conserva Registered. Cada cambio recibe `expectedVersion`; los saltos y cierres requieren `reason`. Cerrar requiere además `confirmNoCriticalCommitments=true`, confirmado por el responsable autorizado. La comprobación automática entre dominios está pendiente. La actualización, el incremento de versión y su auditoría se guardan en una transacción.
-
-## Contrato compartido por web y móvil
-
-| Método | Ruta del gateway | Resultado |
-| --- | --- | --- |
-| GET | `/api/desastres` | `200`, arreglo de desastres (vacío si no hay registros). |
-| GET | `/api/desastres/{id}` | `200`, un desastre; `404` si no existe. |
-| POST | `/api/desastres` | `201` al crear, `200` al repetir la operación, `409` si cambia su contenido; `400` si los datos o la clave son inválidos. |
-| PUT | `/api/desastres/{id}` | Actualiza los campos autorizados con `expectedVersion`; `409` ante una versión obsoleta. |
-| PUT | `/api/desastres/{id}/fase` | Cambia la fase con control de versión y auditoría. |
-| GET | `/api/desastres/{id}/historial` | Historial autorizado con responsable, fecha, cambios, resultado y justificación. |
-| GET / POST | `/api/tipos-desastre` | Consulta pública / alta administrativa. |
-| PUT | `/api/tipos-desastre/{id}/desactivar` | Desactivación administrativa sin borrar referencias históricas. |
-
-Solicitud de registro, con la cabecera `Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000`:
-
-```json
-{
-  "nombre": "Inundación del río Bogotá",
-  "ubicacion": "Bogotá, Cundinamarca",
-  "severidad": 4,
-  "descripcion": "Desbordamiento del río que afecta las vías del sector.",
-  "latitud": 4.7110,
-  "longitud": -74.0721
-}
-```
-
-La respuesta incluye los campos originales, un `id` entero generado por PostgreSQL, `radio` nullable, `phase` y `version`. Los seis atributos originales del ejemplo son obligatorios. `radio`, `disasterTypeId`, `startedAt` y `attentionLevel` son opcionales; su omisión representa información desconocida. El catálogo inicial incluye terremoto, inundación, incendio, deslizamiento, huracán y erupción volcánica. La clasificación de atención es independiente de severidad: 1 Bajo, 2 Medio, 3 Alto y 4 Crítico. `startedAt` acepta una fecha con zona horaria y se normaliza a UTC. `registeredAt` y `updatedAt` son generados por el servidor; los históricos sin fecha comprobable conservan null. Límites: nombre 120 caracteres, ubicación 200, descripción 2000; severidad entera de 1 a 5; latitud de −90 a 90; longitud de −180 a 180. Los errores de negocio incluyen un objeto `errors` con mensajes por campo en formato Problem Details.
-
-Hay solicitudes listas para ejecutar en [DisasterLocation.http](DisasterLocation/DisasterLocation.http). El documento OpenAPI está en http://localhost:5156/openapi/v1.json cuando la API corre en desarrollo.
-
-La presentación web llama a `fetch('/api/desastres')`. Un cliente móvil .NET puede enviar el mismo cuerpo:
-
-```csharp
-using System.Net.Http.Json;
-
-using var client = new HttpClient { BaseAddress = new Uri("http://IP_DEL_COMPUTADOR:5080") };
-// Generar una vez por reporte y conservar este valor para sus reintentos.
-client.DefaultRequestHeaders.Add("Idempotency-Key", Guid.NewGuid().ToString());
-var response = await client.PostAsJsonAsync("/api/desastres", new
-{
-    nombre = "Deslizamiento",
-    ubicacion = "Bogotá",
-    severidad = 3,
-    descripcion = "Material sobre la vía.",
-    latitud = 4.7110,
-    longitud = -74.0721
-});
-response.EnsureSuccessStatusCode();
-```
-
-## Reintentos desde Android
-
-Cada reporte pendiente debe tener su propio UUID, creado y guardado en el teléfono junto con el contenido antes del primer envío. Al recuperar la conexión, Android vuelve a enviar ese mismo cuerpo y esa misma clave. Tanto `201` como `200` confirman el registro: guarda el ID del servidor y marca el pendiente como sincronizado. Si se pierde la respuesta, se puede repetir la solicitud sin crear otro registro.
-
-Un `400` requiere corregir los datos. Un `409` indica que la clave ya pertenece a otro contenido y requiere revisar el pendiente; no debe reintentarse indefinidamente ni cambiarse el UUID automáticamente. Para fallos de red o del servidor, conserva el pendiente y reintenta con espera progresiva. La cola local y el trabajo automático de sincronización se implementan en Android; este repositorio prepara la API. `DataSet` y `DataTable` son componentes de .NET y no se necesitan en el servidor para este flujo.
-
-Con Retrofit, `@POST("desastres")` funciona si el `baseUrl` termina en `/api/`, por ejemplo `http://IP_DEL_COMPUTADOR:5080/api/`. El JSON de respuesta sigue teniendo los mismos campos, incluido el `id` entero, por lo que sirve para `DisasterInfoDto`.
-
-La cabecera acepta un UUID con guiones, distinto de cero, sin distinguir mayúsculas. Si se envía vacía o con un formato inválido, se responde `400`. Para conservar la compatibilidad con la web actual, las solicitudes sin cabecera siguen creando registros, pero sus reenvíos no se deduplican. La comparación contempla los seis campos originales, `radio`, `disasterTypeId`, `startedAt` y `attentionLevel`, después de quitar los espacios al inicio y al final de los textos. Omitir `radio` equivale a enviarlo como `null`. Reutilizar la misma clave con un radio diferente, incluido cambiar entre `null` y un valor, devuelve `409` y no modifica el registro anterior.
-
-El contenido original de creación se conserva de forma atómica e inmutable. Un POST repetido confirma ese contenido y su versión inicial, incluso si un PUT modificó después el desastre. GET devuelve el estado vigente; el cliente no debe reemplazarlo con un recibo histórico. Las operaciones anteriores conservan sus campos omitidos como null. Si el contenido histórico no puede reconstruirse con certeza, la repetición devuelve 409 y requiere revisión.
-
-Puedes comprobarlo con:
-
-```bash
-KEY="550e8400-e29b-41d4-a716-446655440000"
-BODY='{"nombre":"Deslizamiento","ubicacion":"Bogotá","severidad":4,"descripcion":"Deslizamiento sobre una vía","latitud":4.711,"longitud":-74.0721}'
-
-curl -i http://localhost:5080/api/desastres \
-  -H 'Content-Type: application/json' \
-  -H "Idempotency-Key: $KEY" \
-  -d "$BODY"
-```
-
-La primera vez devuelve `201`. Repite el comando: devuelve `200` con el mismo ID. Cambia `nombre` en `BODY` sin cambiar `KEY`: devuelve `409`. Con `curl http://localhost:5080/api/desastres` puedes confirmar que solo se creó un registro para esa operación.
-
-El gateway no necesita saber si la solicitud viene de una web o de una app móvil. Para ver la web en un celular conectado a la misma red, inicia el gateway con:
-
-```bash
-ReverseProxy__Clusters__disasters-api__Destinations__local__Address=http://localhost:5156/ \
-  dotnet run --project ../disaster-api-gateway/DisasterLocation.Gateway --launch-profile http --urls http://0.0.0.0:5080
-```
-
-En el celular abre `http://IP_DEL_COMPUTADOR:5080`. `localhost` en el teléfono apunta al propio teléfono. La API puede seguir escuchando solo en localhost, ya que el gateway corre en el computador. La red y el firewall deben permitir el puerto 5080. Una app nativa puede requerir habilitar HTTP local en su configuración de desarrollo; para despliegue usa HTTPS.
-
-Para una web alojada en otro origen, agrega su dirección exacta a `Cors:AllowedOrigins` en la configuración del gateway. La interfaz incluida usa el mismo origen y no necesita esta configuración. Si cambias el puerto de la API, actualiza `ReverseProxy:Clusters:disasters-api:Destinations:local:Address` en el gateway.
-
-La biblioteca Leaflet está incluida localmente en `wwwroot/lib/leaflet` del repositorio `disaster-api-gateway`, con su licencia. El mapa base de OpenStreetMap requiere internet. El formulario y la lista siguen disponibles si las imágenes del mapa no cargan.
-
-## Verificación
-
-Las pruebas requieren `psycopg2` y un PostgreSQL local accesible por socket Unix, cuyo usuario pueda crear bases temporales. Configura `PGSOCKET` con el directorio de ese socket:
-
-```bash
-export TEST_POSTGRES_DSN="host=${PGSOCKET:?Configura el socket PostgreSQL local} port=5432 dbname=postgres user=$(id -un)"
+export TEST_POSTGRES_DSN="host=${PGSOCKET:?Configura socket PostgreSQL local} port=5432 dbname=postgres user=$(id -un)"
 export TEST_POSTGRES_CONNECTION="Host=$PGSOCKET;Port=5432;Database=postgres;Username=$(id -un)"
-dotnet build
-dotnet test --no-build
-dotnet build ../disaster-api-gateway/DisasterLocation.Gateway.sln
-python3 scripts/smoke_test.py
+dotnet test
 ```
 
-La prueba inicia API y gateway en puertos temporales y usa bases temporales. Comprueba el registro web y móvil, validación, reintentos `201/200`, conflictos `409`, solicitudes concurrentes, CORS y el índice único. También comprueba que un reintento conserva su ID tras reiniciar la API y que dos instancias comparten la misma operación idempotente. Las migraciones se aplican antes de iniciar las APIs de prueba. Al terminar detiene los procesos y elimina sus datos de prueba.
-
-Referencias: [YARP](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/yarp/getting-started?view=aspnetcore-10.0), [Npgsql con EF Core](https://www.npgsql.org/efcore/), [Leaflet 1.9](https://leafletjs.com/examples-v1/quick-start/).
-
-### Sincronización móvil
-
-POST /api/desastres/batch recibe operations, un arreglo de elementos con clientRequestId y disaster (el contrato de creación). Cada operación devuelve Created, AlreadyProcessed, ValidationError, Conflict o RetryableFailure, correlacionada por su UUID; las confirmaciones incluyen disaster.id y el recibo original. HTTP 200 del lote no confirma los elementos sin resultado válido. Se conserva el POST individual y su cabecera Idempotency-Key.
-
-Synchronization configura MaxBatchOperations (50), MaxBatchBodyBytes (1048576), MaxPageSize (50) y ConcurrentRequests (2). La concurrencia de sincronización debe ser menor que Maximum Pool Size para reservar conexiones a operaciones interactivas. Las operaciones del lote utilizan scopes independientes y se procesan secuencialmente, sin una transacción compartida.
-
-GET /api/desastres/sync acepta cursor opaco opcional y limit. Devuelve items, nextCursor y hasMore. La primera consulta inicia la carga paginada; las siguientes usan exclusivamente el cursor confirmado. Un índice sobre SyncSequence limita las lecturas. PostgreSQL asigna la revisión bajo un advisory lock transaccional antes de modificar filas, evitando avanzar por delante de cambios sin confirmar. La secuencia conserva CACHE 1, incremento 1 y NO CYCLE; estas propiedades forman parte de la garantía del cursor. Esto serializa brevemente las escrituras del dominio; no mantiene una transacción entre páginas ni conserva un historial de cambios. Los registros que cambian durante la paginación pueden reaparecer con una versión mayor. El protocolo no propaga eliminaciones: el servicio no ofrece una operación de borrado.
-
-La migración incremental incorpora filas históricas sin alterar versiones, fechas ni recibos de creación. El rol de ejecución necesita USAGE sobre la secuencia disasters."DisasterSyncSequence"; las credenciales de migración siguen separadas. Core 3 y DAL 4 reflejan la ampliación del contrato del repositorio; Security permanece en 1.0.0.
-
-Para comparar ambos protocolos sobre PostgreSQL local aislado, con las aplicaciones ya compiladas:
+Se requiere PostgreSQL aislado por socket Unix, permisos para bases temporales y `psycopg2` para los scripts Python. Nunca utilizar el proyecto Supabase de entrega.
 
 ```bash
-python3 scripts/smoke_test.py --benchmark
+python3 scripts/smoke_test.py
+python3 scripts/async_ingestion_test.py
 ```
 
-El comando utiliza TEST_POSTGRES_DSN, crea y elimina sus propias bases y procesos, y realiza tres repeticiones intercaladas por protocolo. Cada repetición calienta las rutas, registra 130 operaciones, mantiene consultas y un cambio de fase concurrentes, descarga inicialmente 132 registros (incluidos dos de calentamiento) y actualiza cinco. Mide solicitudes, bytes HTTP (cabeceras, cuerpos y framing HTTP; sin TCP/TLS), registros por segundo, percentiles por solicitud, errores y conexiones PostgreSQL. Los tiempos por lote incluyen hasta 50 operaciones; no son latencias por registro ni una validación de los objetivos de disponibilidad o concurrencia del enunciado.
+La ingesta requiere RabbitMQ local y crea un virtual host dedicado. Validar creación, duplicados concurrentes, ámbito del creador y de organización, Delta, fases, pérdida de respuesta y recepción durable. `smoke_test.py --benchmark` compara protocolos (no prueba el SLA).
 
-### Procedencia, responsabilidades y geografía
+## Alcance y validación
 
-`POST /api/reportes-desastre` recibe `sourceKind` (`Internal`/`External`), `sourceId`, `sourceReportId` y `content` (objeto JSON, máximo 64 KiB). La identidad única es `(sourceId, sourceReportId)`: un reintento equivalente devuelve 200 y contenido distinto devuelve 409. Solo una fuente externa puede solicitar `createPreliminary: true`, acompañada de `disaster` con el contrato de creación canónico. El evento resultante comienza en `Detected`; el registro manual continúa en `Registered`. El organismo registrador puede identificarse en `registeringOrganizationId`. Se requiere el rol `disasters.integration` o `disasters.admin`, además de los claims de identidad existentes. No se implementan adaptadores de proveedores.
+Los envíos externos se reciben mediante un contrato normalizado; no se certifican conectores de proveedores ni entrega real de alertas. La sincronización asíncrona requiere workers habilitados. No se ejecutaron nuevamente las suites durante esta documentación.
 
-`GET /api/reportes-desastre` consulta los reportes sin asociar. `GET /api/desastres/{id}/reportes` consulta los asociados. `PUT /api/desastres/{id}/reportes/{reportId}` recibe `expectedVersion` y asocia un reporte pendiente sin alterar su contenido ni reasignar reportes ya consolidados. Cada asociación incrementa la versión y registra su auditoría. Las consultas por desastre requieren lectura y acceso por desastre; las modificaciones requieren escritura y el mismo acceso.
+Referencia del código consultado: [`e358654`](https://github.com/disaster-management-platform/disaster-backend-offline/tree/e358654e7d5d7fe3b7c42c7c3110c54bbcbce334). Los resultados cuantitativos de los atributos de calidad requieren experimentos sobre el despliegue integrado.
 
-`PUT /api/desastres/{id}/organismos` recibe `expectedVersion`, `registeringOrganizationId`, `emergencyResponsibleId` y `organizations: [{organizationId, responsibility}]` (hasta 50 asociaciones). Son referencias estables a organismos o responsables externos; este servicio no administra sus registros maestros. Estas referencias no pueden asignarse desde el DTO de creación; la organización propietaria se obtiene de la identidad verificada.
+## Repositorios relacionados
 
-`PUT /api/desastres/{id}/geografia` recibe `expectedVersion`, `sourceId` opcional y `geography: {polygon, municipalities, neighborhoods, riskZones}`. `polygon` admite GeoJSON `Polygon` WGS84 (longitud-latitud), con anillos cerrados y sin intersecciones; puede ser null. Se admiten hasta 2000 posiciones, 50 anillos, 100 nombres por lista y 64 KiB. Coordenadas y radio siguen actualizándose con el PUT existente. La auditoría conserva los valores anteriores y posteriores, responsable, fecha, versión y fuente cuando se conoce. No se completan datos históricos desconocidos.
+| Repositorio | Responsabilidad |
+| --- | --- |
+| [Infrastructure](https://github.com/disaster-management-platform/disaster-platform-infrastructure) | Despliegue integral |
+| [Presentation](https://github.com/disaster-management-platform/disaster-platform-presentation) | Portal Razor MVC |
+| [Mobile Client](https://github.com/disaster-management-platform/disaster-mobile-client) | Android Offline First |
+| [API Gateway](https://github.com/disaster-management-platform/disaster-api-gateway) | Enrutamiento YARP |
+| [Damage Assessment](https://github.com/disaster-management-platform/disaster-damage-assessmet-service) | Evaluación de daños |
+| [Integration Service](https://github.com/disaster-management-platform/disaster-integration-service) | Interoperabilidad y ACL |
+| [Reconstruction](https://github.com/disaster-management-platform/reconstruction-business-layer) | Proyectos de reconstrucción |
+| [Sahana Eden](https://github.com/disaster-management-platform/sahana-eden) | Gestión humanitaria nativa |
+| [Platform DAL](https://github.com/disaster-management-platform/disaster-platform-dal) | Bibliotecas de persistencia y contratos |
 
-Los cambios de fase, atención y área, y las detecciones, se registran transaccionalmente en `disasters.DisasterOutboxMessages`. `GET /api/desastres/{id}/alertas` permite su consulta autorizada; todavía no hay entregas ni notificaciones enviadas. No se utilizan tablas de Reconstrucción. La asociación de reportes y las modificaciones de responsabilidades o geografía avanzan `Version` y `SyncSequence` dentro de la misma transacción; Delta Sync incluye las nuevas referencias, asociaciones y geografía. Los snapshots anteriores y el contenido de creación permanecen interpretables e inmutables.
+## Autores
 
-### Recepción asíncrona
+<div align="center">
 
-`POST /api/desastres/batch` conserva su comportamiento síncrono. Con `Prefer: respond-async`, cada UUID y comando normalizado se registra en `disasters.DisasterCommandReceipts` antes de responder 202. Los estados Accepted/Processing no confirman la creación. Reenvíe el mismo contenido y UUID para obtener Created/AlreadyProcessed, ValidationError, Conflict o RetryableFailure. No hay un endpoint de recibos. Un rechazo de capacidad sin operaciones aceptadas devuelve 503 con Retry-After; el límite predeterminado es `Ingestion__Capacity=10000` operaciones sin resultado.
+**Pontificia Universidad Javeriana**
 
-Active `Ingestion__DispatcherEnabled=true` para publicar comandos y eventos y `Ingestion__ConsumersEnabled=true` para procesar comandos. Ambos pueden habilitarse en instancias diferentes del mismo servicio. Configure externamente `Ingestion__HostName`, `Port`, `VirtualHost`, `UserName` y `Password`; las credenciales nunca se entregan a clientes. `Ingestion__Consumers` admite 1–8 (2 inicialmente), prefetch 1, tres intentos por entrega y publicación cada `Ingestion__PublishIntervalMilliseconds` (500 inicialmente, mínimo 100). Se reserva capacidad de conexiones para solicitudes interactivas.
+Facultad de Ingeniería — Departamento de Ingeniería de Sistemas
 
-Los exchanges `disasters.commands` y `disasters.events` separan comandos y eventos. La cola durable `disasters.create` utiliza ACK manual y DLQ `disasters.create.dlq`. Los fallos recuperables se reactivan reenviando el mismo comando, sin acceder a la administración del broker. `Ingestion__MaxRecoveries` limita las reactivaciones (3 inicialmente, máximo 10); `Ingestion__RecoveryDelaySeconds` fija la base del backoff exponencial (10 segundos inicialmente). La reactivación comprueba el cupo pendiente y es atómica. Los mensajes antiguos de DLQ no reabren resultados guardados. Tras agotar el límite, `recoveryExhausted` indica revisión administrativa: corregir la causa y autorizar expresamente un aumento acotado del límite, consistente entre instancias, antes de reintentar la misma identidad. No se modifican éxitos ni rechazos permanentes. Los eventos confirmados quedan conservados y disponibles en `disasters.events.pending`; publicación no significa notificación entregada a organismos.
+Arquitectura de Software · 2026-30
 
-Los despachadores reclaman lotes de `Ingestion__DispatchBatchSize` (10 inicialmente, entre 1 y 50) con `SKIP LOCKED` y leases de 30 segundos, renovados por fila inmediatamente antes de publicar; los eventos se atienden antes de los comandos y la espera configurada se realiza una vez por ciclo, no por mensaje; no mantienen transacciones abiertas al contactar RabbitMQ. Confirmaciones perdidas pueden producir duplicados, que se resuelven mediante la identidad persistente. Los eventos históricos conservan sus IDs y payloads. Para validar localmente el flujo esencial: `python3 scripts/async_ingestion_test.py`, con `TEST_POSTGRES_DSN` por socket local y RabbitMQ local accesible. El escenario utiliza y elimina un virtual host exclusivo.
+| Integrantes |
+|:---:|
+| Juan Felipe Rodríguez |
+| Viviana Gómez León |
+| Valeria Catalina Caycedo Ramírez |
+| Sofía Guerra Jiménez |
 
-### Container image
+**Docente:** César Julio Bustacara Medina
 
-Build from the repository root, using BuildKit:
+---
 
-```sh
-docker build --secret id=nuget_credentials,src="$NUGET_CREDENTIALS_FILE" -t disaster-backend-offline:local .
-```
-The private file contains the NuGet credential value `Username=<account>;Password=<token>` for GitHubPackages. Use a read-only package token, permissions 0600; never pass it as an ARG, copy it into a layer, or use a runtime secret for restore.
+### RECONECTA
 
-The runtime runs as the image's non-root application UID, listens on 8080, and receives configuration and trust roots externally. `SDK_IMAGE` and `RUNTIME_IMAGE` can be set to approved image digests for repeatable releases. Version tags are pinned; use approved digests for immutable releases. Configure HTTPS at the trusted ingress and preserve HTTPS issuer/downstream validation; private CA roots must be installed through the deployment trust configuration, never bypassed. Publish ports only as required. No build or normal startup applies database migrations. Supply runtime credentials using the deployment secret store.
+*De la emergencia a la reconstrucción.*
 
-### Reportes manuales coincidentes y área derivada
-
-`GET /api/desastres/coincidencias?disasterTypeId={id}&ubicacion={municipio-o-ciudad}&startedAt={ISO8601}` requiere lectura autenticada y devuelve sólo desastres autorizados del mismo tipo y nombre de municipio/ciudad (primer componente de ubicación, normalizado), dentro de ±72 horas. Son sugerencias: no consolida automáticamente ni compara proximidad inventada.
-
-`POST /api/desastres/{id}/reportes`, con autorización de escritura, `Idempotency-Key` UUID y `{ "report": <CreateDisasterRequest>, "expectedVersion": 3 }`, conserva el contenido original y asocia el reporte sólo al destino elegido. Devuelve el desastre vigente (200); repetición equivalente recupera el resultado, contenido diferente o versión obsoleta devuelve 409. La recepción permanece durable si la asociación falla, para permitir el reintento con el mismo contenido e identidad. No crea otro desastre.
-
-La asociación guarda el vínculo, Version/Delta, auditoría y evento de área en una transacción. Usa la coordenada original recuperable de CreationSnapshot y las coordenadas canónicas conocidas (`latitud`/`longitud`) de reportes asociados. Tres o más puntos no alineados forman un polígono envolvente GeoJSON; su centroide es el centro y la distancia geográfica máxima a los puntos es el radio en metros. Con dos puntos o puntos alineados, el primer punto es centro y el más lejano fija el radio. Un punto único no define radio. Reportes sin coordenadas no inventan geometría ni reemplazan un área existente. Se preservan los límites de 1.000.000 m, 2000 posiciones y 64 KiB, las referencias históricas y el snapshot de creación; no se requiere migración.
-
-### Ámbito persistente de los registros creados
-
-Core 5.0.0 y DAL 7.0.0 incorporan consulta Delta filtrada por ámbito antes de paginar. No hay migración: `CreatedBy` es metadato no mapeado a columna, persistido exclusivamente dentro del snapshot inmutable de creación junto a la organización autenticada. Los cuerpos HTTP no pueden asignarlo. La organización original conserva el ámbito aunque se actualicen referencias operativas; las filas históricas sin organización verificable sólo se habilitan mediante concesiones explícitas o reconciliación administrativa auditada.
-
-Las recepciones asíncronas nuevas incluyen únicamente actor y organización verificados, sin JWT ni credenciales, para que los consumidores independientes persistan el mismo ámbito. Los recibos históricos permanecen intactos: los resultados finales autorizados conservan su semántica y los comandos sin contexto verificable requieren revisión; no se apropian automáticamente al reintentarlos con otra identidad. Room conserva UUID, contenido y estados pendientes cuando una sesión necesita renovarse (401).
+</div>
